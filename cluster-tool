@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+import random
+import subprocess
+import sys
+import textwrap
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+BAREMETAL_HOST = "root@rdu-infra-edge-07.infra-edge.lab.eng.rdu2.redhat.com"
+BAREMETAL_IP = "10.1.155.16"
+SOURCE_CLUSTER_ID = "6ef80144"
+SOURCE_DISK = "/data/test/assisted-test-infra/storage_pool/test-infra-cluster-6ef80144/test-infra-cluster-6ef80144-master-0-disk-0"
+SOURCE_PRIMARY_SUBNET = 135
+SOURCE_SECONDARY_SUBNET = 153
+REMOTE_BASE = "/data/cluster-tool"
+REMOTE_SNAPSHOT = f"{REMOTE_BASE}/golden-snapshot.qcow2"
+REMOTE_OVERLAYS = f"{REMOTE_BASE}/overlays"
+REMOTE_CRYPTO = f"{REMOTE_BASE}/crypto"
+_REAL_HOME = Path(os.path.expanduser(f"~{os.environ.get('SUDO_USER', '')}"))
+LOCAL_STATE_DIR = _REAL_HOME / ".cluster-tool"
+LOCAL_STATE_FILE = LOCAL_STATE_DIR / "state.json"
+KUBECONFIG_DIR = _REAL_HOME / ".kube"
+SUBNET_START = 160
+SUBNET_SECONDARY_OFFSET = 18
+VM_IP_SUFFIX = 10
+VM_MEMORY_KIB = 67108864
+VM_VCPUS = 16
+SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
+RECERT_IMAGE = "quay.io/edge-infrastructure/recert:latest"
+ETCD_IMAGE = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:96e7c7f2ccac380f0b57c6b3be73c09df05d46b3ff7864acb1ba4fc063d72508"
+HOSTS_ENTRIES = [
+    "api.{domain}",
+    "apps.{domain}",
+    "console-openshift-console.apps.{domain}",
+    "oauth-openshift.apps.{domain}",
+    "downloads-openshift-console.apps.{domain}",
+    "alertmanager-main-openshift-monitoring.apps.{domain}",
+    "prometheus-k8s-openshift-monitoring.apps.{domain}",
+    "prometheus-k8s-federate-openshift-monitoring.apps.{domain}",
+    "thanos-querier-openshift-monitoring.apps.{domain}",
+]
+
+
+def load_state():
+    if LOCAL_STATE_FILE.exists():
+        return json.loads(LOCAL_STATE_FILE.read_text())
+    return {"snapshot": None, "clones": {}, "next_subnet": SUBNET_START}
+
+
+def save_state(state):
+    LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOCAL_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def generate_clone_id():
+    return f"{random.randint(0, 0xFFFFFFFF):08x}"
+
+
+def allocate_subnet(state):
+    subnet = state["next_subnet"]
+    state["next_subnet"] = subnet + 1
+    return subnet
+
+
+def generate_mac():
+    return "02:00:00:{:02x}:{:02x}:{:02x}".format(
+        random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)
+    )
+
+
+def gen_primary_network_xml(clone_id, subnet, mac):
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    return textwrap.dedent(f"""\
+        <network>
+          <name>test-infra-net-{clone_id}</name>
+          <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
+          <bridge stp='on' delay='0'/>
+          <mtu size='1500'/>
+          <domain name='{domain}' localOnly='yes'/>
+          <dns enable='yes'>
+            <host ip='192.168.{subnet}.100'>
+              <hostname>api-int.{domain}</hostname>
+              <hostname>api.{domain}</hostname>
+            </host>
+            <host ip='192.168.{subnet}.101'>
+              <hostname>oauth-openshift.apps.{domain}</hostname>
+              <hostname>console-openshift-console.apps.{domain}</hostname>
+              <hostname>canary-openshift-ingress-canary.apps.{domain}</hostname>
+            </host>
+          </dns>
+          <ip family='ipv4' address='192.168.{subnet}.1' prefix='24'>
+            <dhcp>
+              <range start='192.168.{subnet}.128' end='192.168.{subnet}.254'/>
+              <host mac='{mac}' name='test-infra-cluster-{clone_id}-master-0' ip='192.168.{subnet}.{VM_IP_SUFFIX}'/>
+            </dhcp>
+          </ip>
+        </network>""")
+
+
+def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    return textwrap.dedent(f"""\
+        <network>
+          <name>test-infra-secondary-network-{clone_id}</name>
+          <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
+          <bridge stp='on' delay='0'/>
+          <mtu size='1500'/>
+          <domain name='{domain}' localOnly='yes'/>
+          <dns enable='yes'>
+            <host ip='192.168.{subnet_primary}.100'>
+              <hostname>api-int.{domain}</hostname>
+              <hostname>api.{domain}</hostname>
+            </host>
+            <host ip='192.168.{subnet_primary}.101'>
+              <hostname>oauth-openshift.apps.{domain}</hostname>
+              <hostname>console-openshift-console.apps.{domain}</hostname>
+              <hostname>canary-openshift-ingress-canary.apps.{domain}</hostname>
+            </host>
+          </dns>
+          <ip family='ipv4' address='192.168.{subnet_secondary}.1' prefix='24'>
+            <dhcp>
+              <range start='192.168.{subnet_secondary}.128' end='192.168.{subnet_secondary}.254'/>
+              <host mac='{mac}' name='test-infra-cluster-{clone_id}-master-0' ip='192.168.{subnet_secondary}.{VM_IP_SUFFIX}'/>
+            </dhcp>
+          </ip>
+        </network>""")
+
+
+def gen_vm_xml(clone_id, overlay_disk, mac_primary, mac_secondary):
+    return textwrap.dedent(f"""\
+        <domain type='kvm'>
+          <name>test-infra-cluster-{clone_id}-master-0</name>
+          <memory unit='KiB'>{VM_MEMORY_KIB}</memory>
+          <currentMemory unit='KiB'>{VM_MEMORY_KIB}</currentMemory>
+          <vcpu placement='static'>{VM_VCPUS}</vcpu>
+          <os>
+            <type arch='x86_64' machine='pc-i440fx-rhel7.6.0'>hvm</type>
+            <boot dev='hd'/>
+          </os>
+          <features><acpi/><apic/><pae/></features>
+          <cpu mode='host-passthrough' check='none' migratable='on'/>
+          <clock offset='utc'/>
+          <on_poweroff>destroy</on_poweroff>
+          <on_reboot>restart</on_reboot>
+          <on_crash>destroy</on_crash>
+          <devices>
+            <emulator>/usr/libexec/qemu-kvm</emulator>
+            <disk type='file' device='disk'>
+              <driver name='qemu' type='qcow2'/>
+              <source file='{overlay_disk}'/>
+              <target dev='sda' bus='scsi'/>
+            </disk>
+            <controller type='scsi' index='0' model='virtio-scsi'/>
+            <interface type='network'>
+              <mac address='{mac_primary}'/>
+              <source network='test-infra-net-{clone_id}'/>
+              <model type='virtio'/>
+            </interface>
+            <interface type='network'>
+              <mac address='{mac_secondary}'/>
+              <source network='test-infra-secondary-network-{clone_id}'/>
+              <model type='virtio'/>
+            </interface>
+            <serial type='pty'><target port='0'/></serial>
+            <console type='pty'><target type='serial' port='0'/></console>
+          </devices>
+        </domain>""")
+
+
+def gen_haproxy_additions(clone_id, subnet):
+    ip = f"192.168.{subnet}.{VM_IP_SUFFIX}"
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    use_backends = {
+        "api": f"    use_backend api-{clone_id} if {{ req_ssl_sni -m end {domain} }}",
+        "ingress-https": f"    use_backend ingress-https-{clone_id} if {{ req_ssl_sni -m end {domain} }}",
+        "ingress-http": f"    use_backend ingress-http-{clone_id} if {{ hdr_end(host) {domain} }}",
+    }
+    backends = (
+        f"\nbackend api-{clone_id}\n"
+        f"    server api {ip}:6443 check\n"
+        f"\nbackend ingress-https-{clone_id}\n"
+        f"    server ingress {ip}:443 check\n"
+        f"\nbackend ingress-http-{clone_id}\n"
+        f"    mode http\n"
+        f"    server ingress {ip}:80 check\n"
+    )
+    return use_backends, backends
+
+
+def gen_hosts_block(clone_id):
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    lines = [f"# cluster-tool:begin:{clone_id}"]
+    for entry in HOSTS_ENTRIES:
+        lines.append(f"{BAREMETAL_IP} {entry.format(domain=domain)}")
+    lines.append(f"# cluster-tool:end:{clone_id}")
+    return "\n".join(lines)
+
+
+def print_step(num, total, desc, status=""):
+    if status:
+        print(f"\r  [{num}/{total}] {desc:<40s} {status}")
+    else:
+        print(f"  [{num}/{total}] {desc:<40s}", end="", flush=True)
+
+
+def ssh_baremetal(cmd, check=True):
+    r = subprocess.run(
+        ["ssh"] + SSH_OPTS + [BAREMETAL_HOST, cmd],
+        capture_output=True, text=True,
+    )
+    if check and r.returncode != 0:
+        sys.exit(f"SSH command failed (exit {r.returncode}): {cmd}\n{r.stderr.strip()}")
+    return r
+
+
+def ssh_vm(vm_ip, cmd, check=True):
+    jump = f"ssh {' '.join(SSH_OPTS)} core@{vm_ip} '{cmd}'"
+    return ssh_baremetal(jump, check=check)
+
+
+def scp_from_baremetal(remote_path, local_path):
+    subprocess.run(
+        ["scp"] + SSH_OPTS + [f"{BAREMETAL_HOST}:{remote_path}", str(local_path)],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def write_remote_file(path, content):
+    encoded = base64.b64encode(content.encode()).decode()
+    ssh_baremetal(f"echo '{encoded}' | base64 -d > {path}")
+
+
+def add_haproxy_clone(clone_id, subnet):
+    use_backends, backends = gen_haproxy_additions(clone_id, subnet)
+    result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
+    config = result.stdout
+
+    for key in ["api", "ingress-https", "ingress-http"]:
+        marker = f"    default_backend {key}-"
+        config = config.replace(marker, f"{use_backends[key]}\n\n{marker}", 1)
+
+    config = config.rstrip() + "\n" + backends
+    write_remote_file("/etc/haproxy/haproxy.cfg", config)
+    ssh_baremetal("systemctl reload haproxy")
+
+
+def remove_haproxy_clone(clone_id):
+    result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
+    lines = result.stdout.split("\n")
+    filtered = []
+    skip_block = False
+    for line in lines:
+        if f"use_backend" in line and f"-{clone_id}" in line:
+            continue
+        if line.strip().startswith("backend") and f"-{clone_id}" in line:
+            skip_block = True
+            continue
+        if skip_block:
+            if line.strip() and not line.strip().startswith("backend") and not line.strip().startswith("frontend"):
+                continue
+            skip_block = False
+            if not line.strip():
+                continue
+        filtered.append(line)
+    write_remote_file("/etc/haproxy/haproxy.cfg", "\n".join(filtered))
+    ssh_baremetal("systemctl reload haproxy")
+
+
+def add_hosts_entries(clone_id):
+    block = gen_hosts_block(clone_id)
+    print(f"\n  Run this to add /etc/hosts entries:\n")
+    print(f"    sudo tee -a /etc/hosts <<'EOF'\n{block}\nEOF\n")
+
+
+def remove_hosts_entries(clone_id):
+    print(f"\n  Run this to remove /etc/hosts entries:\n")
+    print(f"    sudo sed -i '/cluster-tool:begin:{clone_id}/,/cluster-tool:end:{clone_id}/d' /etc/hosts\n")
+
+
+def verify_cluster_identity(vm_ip, expected_id, expected_domain):
+    kc = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
+    r = ssh_vm(vm_ip,
+        f"sudo oc --kubeconfig={kc} --insecure-skip-tls-verify "
+        f"get infrastructure cluster "
+        f'-o jsonpath="{{.status.apiServerURL}}"',
+        check=False)
+    if r.returncode != 0:
+        sys.exit(f"Failed to verify cluster identity: {r.stderr.strip()}")
+    api_url = r.stdout.strip()
+    if expected_domain not in api_url:
+        sys.exit(
+            f"IDENTITY MISMATCH: apiServerURL is '{api_url}' but expected domain '{expected_domain}'. "
+            f"Recert may have failed to update the infrastructure resource. "
+            f"Aborting to prevent source cluster corruption."
+        )
+
+
+def cmd_snapshot(args):
+    state = load_state()
+    vm_name = f"test-infra-cluster-{SOURCE_CLUSTER_ID}-master-0"
+
+    r = ssh_baremetal(f"virsh domstate {vm_name}")
+    vm_state = r.stdout.strip()
+    if vm_state != "running":
+        sys.exit(f"Source VM '{vm_name}' is '{vm_state}', expected 'running'")
+
+    print(f"Creating golden snapshot from {vm_name}...")
+
+    print_step(1, 5, "Extracting crypto keys")
+    vm_ip = f"192.168.{SOURCE_PRIMARY_SUBNET}.{VM_IP_SUFFIX}"
+    source_kc = "/home/test/assisted-test-infra/build/kubeconfig/kubeconfig_test-infra-cluster-6ef80144"
+    oc = f"KUBECONFIG={source_kc} oc --insecure-skip-tls-verify --server=https://{vm_ip}:6443"
+    ssh_baremetal(f"mkdir -p {REMOTE_CRYPTO}")
+    for secret, ns, dest in [
+        ("loadbalancer-serving-signer", "openshift-kube-apiserver-operator", "lb-signer.key"),
+        ("localhost-serving-signer", "openshift-kube-apiserver-operator", "localhost-signer.key"),
+        ("service-network-serving-signer", "openshift-kube-apiserver-operator", "service-network-signer.key"),
+        ("router-ca", "openshift-ingress-operator", "ingress.key"),
+    ]:
+        ssh_baremetal(f"{oc} extract secret/{secret} -n {ns} --keys=tls.key --to=- > {REMOTE_CRYPTO}/{dest}")
+    ssh_baremetal(f"{oc} extract configmap/admin-kubeconfig-client-ca -n openshift-config --keys=ca-bundle.crt --to=- > {REMOTE_CRYPTO}/admin-kubeconfig-client-ca.crt")
+    ingress_cn = ssh_baremetal(
+        f"{oc} get secret/router-ca -n openshift-ingress-operator "
+        f"-o jsonpath='{{.data.tls\\.crt}}' | base64 -d | openssl x509 -noout -subject | sed 's/subject=CN *= *//'")
+    if not ingress_cn.stdout.strip():
+        sys.exit("Failed to extract ingress operator CN")
+    ssh_baremetal(f"echo '{ingress_cn.stdout.strip()}' > {REMOTE_CRYPTO}/ingress-cn.txt")
+    print_step(1, 5, "Extracting crypto keys", "done")
+
+    print_step(2, 5, "Shutting down VM")
+    ssh_baremetal(f"virsh shutdown {vm_name}")
+    for _ in range(60):
+        r = ssh_baremetal(f"virsh domstate {vm_name}")
+        if "shut off" in r.stdout:
+            break
+        time.sleep(2)
+    else:
+        sys.exit("VM did not shut down in 2 minutes")
+    print_step(2, 5, "Shutting down VM", "done")
+
+    print_step(3, 5, "Creating directories")
+    ssh_baremetal(f"mkdir -p {REMOTE_BASE} {REMOTE_OVERLAYS}")
+    print_step(3, 5, "Creating directories", "done")
+
+    print_step(4, 5, "Copying disk (~33GB, this takes a few minutes)")
+    ssh_baremetal(f"cp --sparse=always {SOURCE_DISK} {REMOTE_SNAPSHOT}")
+    ssh_baremetal(f"chown qemu:qemu {REMOTE_SNAPSHOT}")
+    print_step(4, 5, "Copying disk (~33GB)", "done")
+
+    print_step(5, 5, "Restarting source VM")
+    ssh_baremetal(f"virsh start {vm_name}")
+    print_step(5, 5, "Restarting source VM", "done")
+
+    state["snapshot"] = {
+        "source_cluster": SOURCE_CLUSTER_ID,
+        "source_disk": SOURCE_DISK,
+        "golden_snapshot": REMOTE_SNAPSHOT,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_state(state)
+    print(f"\nSnapshot created at {REMOTE_SNAPSHOT}")
+
+
+def cmd_boot(args):
+    state = load_state()
+    if not state.get("snapshot"):
+        sys.exit("No snapshot found. Run 'cluster-tool snapshot' first.")
+
+    clone_id = args.name or generate_clone_id()
+    if clone_id in state.get("clones", {}):
+        sys.exit(f"Clone '{clone_id}' already exists.")
+
+    subnet = allocate_subnet(state)
+    subnet_sec = subnet + SUBNET_SECONDARY_OFFSET
+    mac1, mac2 = generate_mac(), generate_mac()
+    vm_ip = f"192.168.{subnet}.{VM_IP_SUFFIX}"
+    overlay = f"{REMOTE_OVERLAYS}/{clone_id}.qcow2"
+    vm_name = f"test-infra-cluster-{clone_id}-master-0"
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+
+    total = 8
+    print(f'Creating clone "{clone_id}"...')
+    cleanup = []
+
+    try:
+        print_step(1, total, "Creating disk overlay")
+        ssh_baremetal(f"qemu-img create -f qcow2 -b {REMOTE_SNAPSHOT} -F qcow2 {overlay}")
+        ssh_baremetal(f"chown qemu:qemu {overlay}")
+        cleanup.append(lambda: ssh_baremetal(f"rm -f {overlay}", check=False))
+        print_step(1, total, "Creating disk overlay", "done")
+
+        print_step(2, total, f"Creating network 192.168.{subnet}.0/24")
+        primary_xml = gen_primary_network_xml(clone_id, subnet, mac1)
+        secondary_xml = gen_secondary_network_xml(clone_id, subnet, subnet_sec, mac2)
+        write_remote_file(f"/tmp/net-{clone_id}.xml", primary_xml)
+        ssh_baremetal(f"virsh net-define /tmp/net-{clone_id}.xml")
+        cleanup.append(lambda: ssh_baremetal(f"virsh net-undefine test-infra-net-{clone_id}", check=False))
+        ssh_baremetal(f"virsh net-start test-infra-net-{clone_id}")
+        cleanup.append(lambda: ssh_baremetal(f"virsh net-destroy test-infra-net-{clone_id}", check=False))
+        write_remote_file(f"/tmp/snet-{clone_id}.xml", secondary_xml)
+        ssh_baremetal(f"virsh net-define /tmp/snet-{clone_id}.xml")
+        cleanup.append(lambda: ssh_baremetal(f"virsh net-undefine test-infra-secondary-network-{clone_id}", check=False))
+        ssh_baremetal(f"virsh net-start test-infra-secondary-network-{clone_id}")
+        cleanup.append(lambda: ssh_baremetal(f"virsh net-destroy test-infra-secondary-network-{clone_id}", check=False))
+        ssh_baremetal(f"rm -f /tmp/net-{clone_id}.xml /tmp/snet-{clone_id}.xml")
+        print_step(2, total, f"Creating network 192.168.{subnet}.0/24", "done")
+
+        print_step(3, total, "Booting VM")
+        vm_xml = gen_vm_xml(clone_id, overlay, mac1, mac2)
+        write_remote_file(f"/tmp/vm-{clone_id}.xml", vm_xml)
+        ssh_baremetal(f"virsh define /tmp/vm-{clone_id}.xml")
+        cleanup.append(lambda: ssh_baremetal(f"virsh undefine {vm_name}", check=False))
+        ssh_baremetal(f"virsh start {vm_name}")
+        cleanup.append(lambda: ssh_baremetal(f"virsh destroy {vm_name}", check=False))
+        ssh_baremetal(f"rm -f /tmp/vm-{clone_id}.xml")
+        print_step(3, total, "Booting VM", "done")
+
+        print_step(4, total, "Waiting for SSH")
+        for _ in range(60):
+            if ssh_vm(vm_ip, "echo ready", check=False).returncode == 0:
+                break
+            time.sleep(5)
+        else:
+            sys.exit("SSH not available after 5 minutes")
+        print_step(4, total, "Waiting for SSH", "done")
+
+        print_step(5, total, "Running recert")
+        src_ip = f"192.168.{SOURCE_PRIMARY_SUBNET}.{VM_IP_SUFFIX}"
+        src_sec_ip = f"192.168.{SOURCE_SECONDARY_SUBNET}.{VM_IP_SUFFIX}"
+        new_sec_ip = f"192.168.{subnet_sec}.{VM_IP_SUFFIX}"
+
+        ssh_vm(vm_ip, "sudo systemctl stop kubelet")
+        time.sleep(5)
+        ssh_vm(vm_ip, "sudo systemctl stop crio")
+        time.sleep(5)
+
+        ssh_baremetal(f"scp {' '.join(SSH_OPTS)} -r {REMOTE_CRYPTO} core@{vm_ip}:/tmp/crypto")
+        ingress_cn = ssh_baremetal(f"cat {REMOTE_CRYPTO}/ingress-cn.txt").stdout.strip()
+
+        ssh_vm(vm_ip,
+            f"sudo podman run -d --name etcd-recert "
+            f"--network host --privileged "
+            f"-v /var/lib/etcd:/var/lib/etcd "
+            f"{ETCD_IMAGE} "
+            f"--data-dir /var/lib/etcd "
+            f"--listen-client-urls http://localhost:2379 "
+            f"--advertise-client-urls http://localhost:2379 "
+            f"--listen-peer-urls http://localhost:2380 "
+            f"--force-new-cluster")
+
+        for _ in range(30):
+            r = ssh_vm(vm_ip, "curl -sf http://localhost:2379/health 2>/dev/null", check=False)
+            if r.returncode == 0:
+                break
+            time.sleep(2)
+        else:
+            logs = ssh_vm(vm_ip, "sudo podman logs etcd-recert 2>&1 | tail -20", check=False)
+            sys.exit(f"Standalone etcd not healthy after 60s.\n{logs.stdout}")
+
+        ssh_vm(vm_ip,
+            f"sudo podman run --rm --name recert "
+            f"--pull=newer "
+            f"--network host --privileged "
+            f"-v /etc/kubernetes:/etc/kubernetes "
+            f"-v /var/lib/kubelet:/var/lib/kubelet "
+            f"-v /etc/machine-config-daemon:/etc/machine-config-daemon "
+            f"-v /etc/cni:/etc/cni "
+            f"-v /tmp/crypto:/tmp/crypto:ro "
+            f"{RECERT_IMAGE} "
+            f"--etcd-endpoint localhost:2379 "
+            f"--crypto-dir /etc/kubernetes "
+            f"--crypto-dir /var/lib/kubelet "
+            f"--crypto-dir /etc/machine-config-daemon "
+            f"--crypto-dir /etc/cni "
+            f"--cluster-customization-dir /etc/kubernetes "
+            f"--cluster-customization-dir /var/lib/kubelet "
+            f"--cluster-customization-dir /etc/machine-config-daemon "
+            f"--use-key kube-apiserver-lb-signer:/tmp/crypto/lb-signer.key "
+            f"--use-key kube-apiserver-localhost-signer:/tmp/crypto/localhost-signer.key "
+            f"--use-key kube-apiserver-service-network-signer:/tmp/crypto/service-network-signer.key "
+            f"--use-key {ingress_cn}:/tmp/crypto/ingress.key "
+            f"--cluster-rename test-infra-cluster-{clone_id}:redhat.com "
+            f"--hostname {vm_name} "
+            f"--ip {vm_ip} "
+            f"--cn-san-replace api.test-infra-cluster-{SOURCE_CLUSTER_ID}.redhat.com:api.{domain} "
+            f"--cn-san-replace api-int.test-infra-cluster-{SOURCE_CLUSTER_ID}.redhat.com:api-int.{domain} "
+            f"--cn-san-replace *.apps.test-infra-cluster-{SOURCE_CLUSTER_ID}.redhat.com:*.apps.{domain} "
+            f"--cn-san-replace test-infra-cluster-{SOURCE_CLUSTER_ID}-master-0:{vm_name} "
+            f"--cn-san-replace system:node:test-infra-cluster-{SOURCE_CLUSTER_ID}-master-0,system:node:{vm_name} "
+            f"--cn-san-replace {src_ip}:{vm_ip} "
+            f"--cn-san-replace {src_sec_ip}:{new_sec_ip}")
+
+        ssh_vm(vm_ip, "sudo podman stop etcd-recert && sudo podman rm etcd-recert")
+
+        ssh_vm(vm_ip, f"sudo hostnamectl set-hostname {vm_name}")
+        ssh_vm(vm_ip, f"sudo sed -i 's/{src_ip}/{vm_ip}/g' /etc/resolv.conf")
+        ssh_vm(vm_ip,
+            f"echo '{vm_ip} api-int.{domain} api.{domain}' | sudo tee -a /etc/hosts")
+
+        ssh_vm(vm_ip, "sudo systemctl start crio")
+        time.sleep(3)
+        ssh_vm(vm_ip, "sudo systemctl start kubelet")
+        print_step(5, total, "Running recert", "done")
+
+        print_step(6, total, "Waiting for cluster health")
+        for _ in range(120):
+            r = ssh_baremetal(f"curl -sk https://{vm_ip}:6443/healthz", check=False)
+            if r.stdout.strip() == "ok":
+                break
+            time.sleep(5)
+        else:
+            sys.exit("Cluster not healthy after 10 minutes")
+        print_step(6, total, "Waiting for cluster health", "done")
+
+        print_step(7, total, "Verifying cluster identity")
+        verify_cluster_identity(vm_ip, clone_id, domain)
+        print_step(7, total, "Verifying cluster identity", "done")
+
+        print_step(8, total, "Configuring access")
+        kubeconfig_path = KUBECONFIG_DIR / f"{clone_id}.kubeconfig"
+        KUBECONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        r = ssh_vm(vm_ip, "sudo cat /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
+        kubeconfig_path.write_text(r.stdout)
+
+        kc = kubeconfig_path.read_text()
+        kc = kc.replace(f"https://{vm_ip}:6443", f"https://api.{domain}:6443")
+        kubeconfig_path.write_text(kc)
+        cleanup.append(lambda: kubeconfig_path.unlink(missing_ok=True))
+
+        add_haproxy_clone(clone_id, subnet)
+        cleanup.append(lambda: remove_haproxy_clone(clone_id))
+        add_hosts_entries(clone_id)
+        cleanup.append(lambda: remove_hosts_entries(clone_id))
+        print_step(8, total, "Configuring access", "done")
+
+    except (SystemExit, subprocess.CalledProcessError) as e:
+        print(f"\nBoot failed, rolling back...")
+        for fn in reversed(cleanup):
+            fn()
+        print("Rollback complete.")
+        if isinstance(e, subprocess.CalledProcessError):
+            sys.exit(f"Command failed: {e.cmd}\n{e.stderr or e.stdout or ''}")
+        raise
+
+    state["clones"][clone_id] = {
+        "subnet_primary": subnet,
+        "subnet_secondary": subnet_sec,
+        "vm_name": vm_name,
+        "overlay_disk": overlay,
+        "mac_primary": mac1,
+        "mac_secondary": mac2,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_state(state)
+
+    print(f'\nCluster "{clone_id}" ready!')
+    print(f"  API:        https://api.{domain}:6443")
+    print(f"  Console:    https://console-openshift-console.apps.{domain}")
+    print(f"  Kubeconfig: {kubeconfig_path}")
+    print(f"\nexport KUBECONFIG={kubeconfig_path}")
+
+
+def cmd_list(args):
+    state = load_state()
+    clones = state.get("clones", {})
+    if not clones:
+        print("No clones running.")
+        return
+    print(f"{'NAME':<14s} {'SUBNET':<22s} {'VM':<50s} {'CREATED'}")
+    print("-" * 110)
+    for cid, info in clones.items():
+        subnet = f"192.168.{info['subnet_primary']}.0/24"
+        created = info.get("created_at", "?")[:19]
+        print(f"{cid:<14s} {subnet:<22s} {info['vm_name']:<50s} {created}")
+
+
+def cmd_destroy(args):
+    state = load_state()
+    if args.all:
+        ids = list(state.get("clones", {}).keys())
+        if not ids:
+            print("No clones to destroy.")
+            return
+    elif args.name:
+        ids = [args.name]
+    else:
+        sys.exit("Specify a clone name or --all")
+
+    for cid in ids:
+        vm = f"test-infra-cluster-{cid}-master-0"
+        overlay = f"{REMOTE_OVERLAYS}/{cid}.qcow2"
+        print(f'Destroying clone "{cid}"...')
+
+        ssh_baremetal(f"virsh destroy {vm}", check=False)
+        ssh_baremetal(f"virsh undefine {vm}", check=False)
+        ssh_baremetal(f"virsh net-destroy test-infra-net-{cid}", check=False)
+        ssh_baremetal(f"virsh net-undefine test-infra-net-{cid}", check=False)
+        ssh_baremetal(f"virsh net-destroy test-infra-secondary-network-{cid}", check=False)
+        ssh_baremetal(f"virsh net-undefine test-infra-secondary-network-{cid}", check=False)
+        ssh_baremetal(f"rm -f {overlay}", check=False)
+
+        remove_haproxy_clone(cid)
+        remove_hosts_entries(cid)
+        (KUBECONFIG_DIR / f"{cid}.kubeconfig").unlink(missing_ok=True)
+        state["clones"].pop(cid, None)
+        print(f'Clone "{cid}" destroyed.')
+
+    save_state(state)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Snapshot-based SNO cluster cloning")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("snapshot", help="Create golden snapshot from running cluster")
+
+    boot_p = sub.add_parser("boot", help="Boot a fresh cluster from snapshot")
+    boot_p.add_argument("--name", help="Clone ID (8 hex chars, random if omitted)")
+
+    sub.add_parser("list", help="Show running clones")
+
+    destroy_p = sub.add_parser("destroy", help="Tear down a clone")
+    destroy_p.add_argument("name", nargs="?", help="Clone ID to destroy")
+    destroy_p.add_argument("--all", action="store_true", help="Destroy all clones")
+
+    args = parser.parse_args()
+    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "destroy": cmd_destroy}
+
+    if args.command not in cmds:
+        parser.print_help()
+        sys.exit(1)
+    cmds[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
