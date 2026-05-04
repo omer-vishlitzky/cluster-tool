@@ -83,11 +83,11 @@ def gen_primary_network_xml(clone_id, subnet, mac):
           <mtu size='1500'/>
           <domain name='{domain}' localOnly='yes'/>
           <dns enable='yes'>
-            <host ip='192.168.{subnet}.100'>
+            <host ip='192.168.{subnet}.{VM_IP_SUFFIX}'>
               <hostname>api-int.{domain}</hostname>
               <hostname>api.{domain}</hostname>
             </host>
-            <host ip='192.168.{subnet}.101'>
+            <host ip='192.168.{subnet}.{VM_IP_SUFFIX}'>
               <hostname>oauth-openshift.apps.{domain}</hostname>
               <hostname>console-openshift-console.apps.{domain}</hostname>
               <hostname>canary-openshift-ingress-canary.apps.{domain}</hostname>
@@ -112,11 +112,11 @@ def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
           <mtu size='1500'/>
           <domain name='{domain}' localOnly='yes'/>
           <dns enable='yes'>
-            <host ip='192.168.{subnet_primary}.100'>
+            <host ip='192.168.{subnet_primary}.{VM_IP_SUFFIX}'>
               <hostname>api-int.{domain}</hostname>
               <hostname>api.{domain}</hostname>
             </host>
-            <host ip='192.168.{subnet_primary}.101'>
+            <host ip='192.168.{subnet_primary}.{VM_IP_SUFFIX}'>
               <hostname>oauth-openshift.apps.{domain}</hostname>
               <hostname>console-openshift-console.apps.{domain}</hostname>
               <hostname>canary-openshift-ingress-canary.apps.{domain}</hostname>
@@ -497,10 +497,21 @@ def cmd_boot(args):
 
         ssh_vm(vm_ip, "sudo podman stop etcd-recert && sudo podman rm etcd-recert")
 
-        ssh_vm(vm_ip, f"sudo hostnamectl set-hostname {vm_name}")
-        ssh_vm(vm_ip, f"sudo sed -i 's/{src_ip}/{vm_ip}/g' /etc/resolv.conf")
-        ssh_vm(vm_ip,
-            f"echo '{vm_ip} api-int.{domain} api.{domain}' | sudo tee -a /etc/hosts")
+        node_fix = (
+            f"import pathlib\n"
+            f"pathlib.Path('/etc/default/sno_dnsmasq_configuration_overrides').write_text("
+            f"'SNO_CLUSTER_NAME_OVERRIDE=test-infra-cluster-{clone_id}\\n"
+            f"SNO_BASE_DOMAIN_OVERRIDE=redhat.com\\n"
+            f"SNO_DNSMASQ_IP_OVERRIDE={vm_ip}\\n')\n"
+            f"pathlib.Path('/etc/default/nodeip-configuration').write_text("
+            f"'KUBELET_NODEIP_HINT=192.168.{subnet}.0\\n')\n"
+            f"import subprocess\n"
+            f"subprocess.run(['hostnamectl', 'set-hostname', '{vm_name}'], check=True)\n"
+            f"subprocess.run(['systemctl', 'restart', 'NetworkManager'], check=True)\n"
+            f"subprocess.run(['systemctl', 'restart', 'dnsmasq'], check=True)\n"
+        )
+        fix_b64 = base64.b64encode(node_fix.encode()).decode()
+        ssh_vm(vm_ip, f"echo {fix_b64} | base64 -d | sudo python3")
 
         ssh_vm(vm_ip, "sudo systemctl start crio")
         time.sleep(3)
