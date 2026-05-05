@@ -136,7 +136,7 @@ def gen_primary_network_xml(clone_id, subnet, mac):
         <network>
           <name>test-infra-net-{clone_id}</name>
           <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
-          <bridge name='br-{clone_id}' stp='on' delay='0'/>
+          <bridge name='br-{clone_id[:8]}' stp='on' delay='0'/>
           <mtu size='1500'/>
           <domain name='{domain}' localOnly='yes'/>
           <dns enable='yes'>
@@ -165,7 +165,7 @@ def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
         <network>
           <name>test-infra-secondary-network-{clone_id}</name>
           <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
-          <bridge name='brs-{clone_id}' stp='on' delay='0'/>
+          <bridge name='bs-{clone_id[:8]}' stp='on' delay='0'/>
           <mtu size='1500'/>
           <domain name='{domain}' localOnly='yes'/>
           <dns enable='yes'>
