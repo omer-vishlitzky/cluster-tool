@@ -71,8 +71,13 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("192.168.160.10", xml)
         self.assertIn("02:00:00:aa:bb:cc", xml)
         self.assertIn("api.test-infra-cluster-a1b2c3d4.redhat.com", xml)
-        self.assertIn("192.168.160.10", xml)
-        self.assertIn("192.168.160.10", xml)
+        self.assertIn("br-a1b2c3d4", xml)
+
+    def test_primary_network_bridge_name_truncated(self):
+        xml = ct.gen_primary_network_xml("caas-pr-cluster", 160, "02:00:00:aa:bb:cc")
+        self.assertIn("br-caas-pr-", xml)
+        bridge = xml.split("name='")[1].split("'")[0]
+        self.assertLessEqual(len(bridge), 15)
 
     def test_secondary_network_xml(self):
         xml = ct.gen_secondary_network_xml("a1b2c3d4", 160, 178, "02:00:00:dd:ee:ff")
@@ -80,6 +85,12 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("192.168.178.1", xml)
         self.assertIn("192.168.178.10", xml)
         self.assertIn("192.168.160.10", xml)  # DNS points to primary VIP
+        self.assertIn("bs-a1b2c3d4", xml)
+
+    def test_secondary_network_bridge_name_truncated(self):
+        xml = ct.gen_secondary_network_xml("caas-pr-cluster", 160, 178, "02:00:00:dd:ee:ff")
+        bridge = xml.split("name='")[1].split("'")[0]
+        self.assertLessEqual(len(bridge), 15)
 
     def test_vm_xml_single_disk(self):
         xml = ct.gen_vm_xml("a1b2c3d4", "/path/overlay.qcow2", "02:00:00:aa:bb:cc", "02:00:00:dd:ee:ff")
