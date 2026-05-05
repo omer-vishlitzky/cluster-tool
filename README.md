@@ -19,22 +19,28 @@ Installing an OpenShift Single Node cluster takes 30-45 minutes. For development
 Source Cluster (installed once)
         |
         v
-  [snapshot]  ──── Golden disk image + CA signing keys
+  [snapshot --name sno-64 --source <id>]
         |
         v
-  [boot]  ──── qcow2 overlay (instant, copy-on-write)
-        |            |
-        v            v
-   New libvirt    recert (new name, new certs,
-   network        new IP, new hostname)
-        |            |
-        v            v
-   HAProxy SNI    Fresh kubeconfig
-   routing        with correct CA
+  Golden disk(s) + CA signing keys + auto-detected VM specs
+  stored in /data/cluster-tool/flavors/<name>/
         |
         v
-   Working cluster accessible
-   from your laptop
+  [boot --flavor sno-64]
+        |
+        v
+  qcow2 overlay(s) ──── recert (new name, new certs,
+  (instant, COW)         new IP, new hostname)
+        |                     |
+        v                     v
+   New libvirt            Fresh kubeconfig
+   network                with correct CA
+        |
+        v
+   HAProxy SNI + dnsmasq DNS
+        |
+        v
+   Working cluster accessible from your laptop
 ```
 
 The tool uses the same certificate regeneration mechanism as Red Hat's [Image Based Install (IBI)](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/edge_computing/image-based-installation-for-single-node-openshift) workflow, which deploys thousands of SNO clusters from a single seed image in production.
@@ -42,11 +48,14 @@ The tool uses the same certificate regeneration mechanism as Red Hat's [Image Ba
 ## Quick Start
 
 ```bash
-# One-time: create a golden snapshot from your running SNO cluster
-./cluster-tool snapshot
+# One-time: create a named snapshot flavor from your running SNO cluster
+./cluster-tool snapshot --name sno-64 --source 6ef80144
+
+# See available flavors
+./cluster-tool flavors
 
 # Boot a fresh cluster (~5 min)
-./cluster-tool boot --name my-test
+./cluster-tool boot --flavor sno-64 --name my-test
 
 # Use it
 export KUBECONFIG=~/.kube/my-test.kubeconfig
@@ -55,8 +64,8 @@ oc get nodes
 # Run smoke tests to verify everything works
 ./cluster-tool verify my-test
 
-# Boot another cluster in parallel
-./cluster-tool boot --name my-test-2
+# Boot another cluster in parallel (from the same or different flavor)
+./cluster-tool boot --flavor sno-64 --name my-test-2
 
 # See what's running
 ./cluster-tool list
@@ -66,29 +75,78 @@ oc get nodes
 ./cluster-tool destroy --all
 ```
 
+## Flavors
+
+Flavors are named snapshot profiles. Each flavor captures a complete VM configuration — disk image(s), CA signing keys, and auto-detected specs (RAM, vCPUs, disk count, etcd image). Different source clusters produce different flavors.
+
+```bash
+# Snapshot different source VMs as named flavors
+./cluster-tool snapshot --name sno-64 --source 6ef80144
+./cluster-tool snapshot --name sno-cnv --source <cnv-cluster-id>
+./cluster-tool snapshot --name sno-acm --source <acm-cluster-id>
+
+# Boot from any flavor
+./cluster-tool boot --flavor sno-64
+./cluster-tool boot --flavor sno-cnv --name my-cnv-test
+
+# List available flavors (shows RAM, CPUs, disk count)
+./cluster-tool flavors
+
+# Delete a flavor
+./cluster-tool flavors --delete sno-cnv
+```
+
+Storage layout on the baremetal host:
+```
+/data/cluster-tool/
+├── flavors/
+│   ├── sno-64/
+│   │   ├── disk-0.qcow2      # Golden OS disk (~63GB)
+│   │   ├── disk-1.qcow2      # Extra disk (e.g., LVMS data), if present
+│   │   └── crypto/            # CA signing keys (~28K)
+│   └── sno-cnv/
+│       ├── disk-0.qcow2
+│       └── crypto/
+└── overlays/                  # Per-clone COW overlays (~250MB-6GB each)
+    ├── my-test-disk-0.qcow2
+    └── my-test-disk-1.qcow2
+```
+
+VMs with multiple disks (e.g., LVMS data disks) are fully supported — all non-CDROM disks are auto-detected, snapshotted, and cloned.
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `snapshot` | Create a golden snapshot from a running source cluster. Extracts the VM disk, CA signing keys, and ingress operator CN. |
-| `boot [--name ID]` | Boot a fresh clone from the snapshot. Creates overlay disk, libvirt networks, runs recert, configures HAProxy, extracts kubeconfig. |
-| `list` | Show all running clones with their subnets and creation times. |
+| `snapshot --name NAME --source ID` | Create a named snapshot flavor from a running source cluster. Auto-detects VM specs, extracts disk(s), CA signing keys, and etcd image. |
+| `boot --flavor NAME [--name ID]` | Boot a fresh clone from a flavor. Creates overlay disk(s), libvirt networks, runs recert, configures HAProxy and DNS, extracts kubeconfig. If `--flavor` is omitted, uses the most recently created flavor. |
+| `flavors [--delete NAME]` | List all available flavors with their specs, or delete one. |
+| `list` | Show all running clones with their flavor, subnet, and creation time. |
 | `verify ID` | Run smoke tests: deploy a pod that validates DNS, API access, image pulls, and service account tokens from inside the cluster. |
-| `destroy ID\|--all` | Tear down a clone. Removes VM, networks, overlay disk, HAProxy entries. Works even if the clone isn't in state (handles orphans). |
+| `destroy ID\|--all` | Tear down a clone. Removes VM, networks, overlay disk(s), HAProxy entries, DNS. Works even if the clone isn't in state. |
 
 ## What Happens During Boot
 
-1. **Create disk overlay** — qcow2 copy-on-write backed by the golden snapshot. Instant, no 33GB copy.
+1. **Create disk overlay(s)** — qcow2 copy-on-write backed by the golden snapshot(s). Instant, no multi-GB copy.
 2. **Create networks** — isolated libvirt NAT networks (primary + secondary) with DNS entries for API and apps hostnames.
-3. **Boot VM** — define and start the clone VM with the overlay disk.
+3. **Boot VM** — define and start the clone VM with the overlay disk(s), using the flavor's RAM and vCPU specs.
 4. **Wait for SSH** — poll until the VM is reachable.
-5. **Run recert** — stop kubelet/crio, start standalone etcd, run recert to regenerate all certificates and rename the cluster identity, configure dnsmasq overrides and nodeip hint, restart services.
+5. **Run recert** — stop kubelet/crio, start standalone etcd (using the flavor's detected etcd image), run recert to regenerate all certificates and rename the cluster identity, configure dnsmasq overrides and nodeip hint, restart services.
 6. **Wait for health** — poll `/healthz` until the API server is ready.
-7. **Wait for operators** — poll all ClusterOperators until they are Available and not Degraded.
-8. **Verify identity** — confirm the infrastructure resource has the correct API URL (prevents accidental source cluster corruption).
-9. **Configure access** — extract kubeconfig, add HAProxy SNI entries, add dnsmasq DNS entry.
+7. **Configure access** — extract kubeconfig, add HAProxy SNI entries, add dnsmasq DNS entry.
+8. **Wait for operators** — poll all ClusterOperators until they are Available and not Degraded.
+9. **Verify identity** — confirm the infrastructure resource has the correct API URL (prevents accidental source cluster corruption).
 
 If any step fails, all previously created resources are rolled back automatically (transactional boot).
+
+## What Happens During Snapshot
+
+1. **Detect VM specs** — parse `virsh dominfo` and `virsh dumpxml` to get RAM, vCPUs, disk paths, and subnets.
+2. **Detect etcd image** — read the etcd pod manifest from the running cluster.
+3. **Extract crypto keys** — the 4 CA signing keys (lb-signer, localhost-signer, service-network-signer, ingress) and the admin kubeconfig CA.
+4. **Shut down VM** — graceful shutdown, wait for "shut off".
+5. **Copy disk(s)** — sparse copy of all detected disks to the flavor directory.
+6. **Restart VM** — bring the source cluster back up.
 
 ## Architecture
 
@@ -102,9 +160,9 @@ Your laptop                          Baremetal host
 │ ~/.kube/    │                      │ │ .160.10  │  │ .161.10  │       │
 │             │                      │ └──────────┘  └──────────┘       │
 └─────────────┘                      │                                   │
+                                     │ Flavors (golden snapshots)        │
                                      │ HAProxy (SNI routing :6443/:443)  │
-                                     │ Golden snapshot (qcow2)           │
-                                     │ CA signing keys (crypto/)         │
+                                     │ Overlays (per-clone COW disks)    │
                                      └───────────────────────────────────┘
 ```
 
@@ -156,26 +214,6 @@ After this, `cluster-tool boot` handles DNS automatically — no manual `/etc/ho
 
 ## Roadmap
 
-### Multi-Flavor Snapshots
-
-Support multiple named snapshot flavors for different VM configurations:
-
-```bash
-# Snapshot different source VMs as named flavors
-./cluster-tool snapshot --name sno-64 --source 6ef80144
-./cluster-tool snapshot --name sno-cnv --source <cnv-cluster-id>
-./cluster-tool snapshot --name sno-acm --source <acm-cluster-id>
-
-# Boot from any flavor
-./cluster-tool boot --flavor sno-64
-./cluster-tool boot --flavor sno-cnv --name my-cnv-test
-
-# List available flavors
-./cluster-tool flavors
-```
-
-Each flavor stores its golden disk(s), crypto keys, and auto-detected VM specs (RAM, vCPUs, disk count). Multi-disk support for VMs with additional storage (e.g., LVMS data disks). See `docs/superpowers/plans/2026-05-04-multi-flavor.md`.
-
 ### Distributable Artifacts via OCI Registry
 
 Push and pull flavors as OCI images via Quay.io:
@@ -204,11 +242,11 @@ A Claude Code skill that lets any AI agent spawn clusters on demand:
 ## Testing
 
 ```bash
-# Run unit tests (20 tests)
+# Run unit tests
 python3 test_cluster_tool.py -v
 
 # Run smoke tests on a live clone
 ./cluster-tool verify <clone-id>
 ```
 
-Tests cover: state management, template generation, transactional rollback at every failure point, reverse cleanup order, CalledProcessError handling, recert flag verification, identity mismatch detection, and the success path.
+Tests cover: state management, template generation, multi-disk VM XML, transactional rollback at every failure point, reverse cleanup order, CalledProcessError handling, recert flag verification, identity mismatch detection, and the success path.
