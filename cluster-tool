@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import fcntl
 import json
 import os
 import random
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -49,6 +51,26 @@ def load_state():
 def save_state(state):
     LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
     LOCAL_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+@contextmanager
+def locked_state():
+    LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = LOCAL_STATE_DIR / "state.lock"
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = load_state()
+        yield state
+        save_state(state)
+
+
+@contextmanager
+def locked_haproxy():
+    LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = LOCAL_STATE_DIR / "haproxy.lock"
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
 
 
 def generate_clone_id():
@@ -273,39 +295,41 @@ def write_remote_file(path, content):
 
 
 def add_haproxy_clone(clone_id, subnet):
-    use_backends, backends = gen_haproxy_additions(clone_id, subnet)
-    result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
-    config = result.stdout
+    with locked_haproxy():
+        use_backends, backends = gen_haproxy_additions(clone_id, subnet)
+        result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
+        config = result.stdout
 
-    for key in ["api", "ingress-https", "ingress-http"]:
-        marker = f"    default_backend {key}-"
-        config = config.replace(marker, f"{use_backends[key]}\n\n{marker}", 1)
+        for key in ["api", "ingress-https", "ingress-http"]:
+            marker = f"    default_backend {key}-"
+            config = config.replace(marker, f"{use_backends[key]}\n\n{marker}", 1)
 
-    config = config.rstrip() + "\n" + backends
-    write_remote_file("/etc/haproxy/haproxy.cfg", config)
-    ssh_baremetal("systemctl reload haproxy")
+        config = config.rstrip() + "\n" + backends
+        write_remote_file("/etc/haproxy/haproxy.cfg", config)
+        ssh_baremetal("systemctl reload haproxy")
 
 
 def remove_haproxy_clone(clone_id):
-    result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
-    lines = result.stdout.split("\n")
-    filtered = []
-    skip_block = False
-    for line in lines:
-        if f"use_backend" in line and f"-{clone_id}" in line:
-            continue
-        if line.strip().startswith("backend") and f"-{clone_id}" in line:
-            skip_block = True
-            continue
-        if skip_block:
-            if line.strip() and not line.strip().startswith("backend") and not line.strip().startswith("frontend"):
+    with locked_haproxy():
+        result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
+        lines = result.stdout.split("\n")
+        filtered = []
+        skip_block = False
+        for line in lines:
+            if f"use_backend" in line and f"-{clone_id}" in line:
                 continue
-            skip_block = False
-            if not line.strip():
+            if line.strip().startswith("backend") and f"-{clone_id}" in line:
+                skip_block = True
                 continue
-        filtered.append(line)
-    write_remote_file("/etc/haproxy/haproxy.cfg", "\n".join(filtered))
-    ssh_baremetal("systemctl reload haproxy")
+            if skip_block:
+                if line.strip() and not line.strip().startswith("backend") and not line.strip().startswith("frontend"):
+                    continue
+                skip_block = False
+                if not line.strip():
+                    continue
+            filtered.append(line)
+        write_remote_file("/etc/haproxy/haproxy.cfg", "\n".join(filtered))
+        ssh_baremetal("systemctl reload haproxy")
 
 
 def add_dns_entry(clone_id):
@@ -426,48 +450,49 @@ def cmd_snapshot(args):
     ssh_baremetal(f"virsh start {vm_name}")
     print_step(6, 6, "Restarting source VM", "done")
 
-    state["flavors"][flavor_name] = {
-        "source_cluster": source_id,
-        "source_primary_subnet": src_primary_subnet,
-        "source_secondary_subnet": src_secondary_subnet,
-        "memory_kib": dominfo["memory_kib"],
-        "vcpus": dominfo["vcpus"],
-        "disks": [f"disk-{i}.qcow2" for i in range(len(disks))],
-        "etcd_image": etcd_image,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    save_state(state)
+    with locked_state() as state:
+        state["flavors"][flavor_name] = {
+            "source_cluster": source_id,
+            "source_primary_subnet": src_primary_subnet,
+            "source_secondary_subnet": src_secondary_subnet,
+            "memory_kib": dominfo["memory_kib"],
+            "vcpus": dominfo["vcpus"],
+            "disks": [f"disk-{i}.qcow2" for i in range(len(disks))],
+            "etcd_image": etcd_image,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
     print(f"\nFlavor '{flavor_name}' created at {fdir}")
 
 
 def cmd_boot(args):
-    state = load_state()
-    flavors = state.get("flavors", {})
-    if not flavors:
-        sys.exit("No flavors available. Run 'cluster-tool snapshot --name NAME --source ID' first.")
+    with locked_state() as state:
+        flavors = state.get("flavors", {})
+        if not flavors:
+            sys.exit("No flavors available. Run 'cluster-tool snapshot --name NAME --source ID' first.")
 
-    flavor_name = args.flavor
-    if not flavor_name:
-        flavor_name = max(flavors, key=lambda k: flavors[k].get("created_at", ""))
-    if flavor_name not in flavors:
-        sys.exit(f"Flavor '{flavor_name}' not found. Available: {', '.join(flavors.keys())}")
+        flavor_name = args.flavor
+        if not flavor_name:
+            flavor_name = max(flavors, key=lambda k: flavors[k].get("created_at", ""))
+        if flavor_name not in flavors:
+            sys.exit(f"Flavor '{flavor_name}' not found. Available: {', '.join(flavors.keys())}")
 
-    flavor = flavors[flavor_name]
-    source_id = flavor["source_cluster"]
-    src_primary = flavor["source_primary_subnet"]
-    src_secondary = flavor["source_secondary_subnet"]
-    memory_kib = flavor["memory_kib"]
-    vcpus = flavor["vcpus"]
-    etcd_image = flavor.get("etcd_image", ETCD_IMAGE)
-    disk_names = flavor.get("disks", ["disk-0.qcow2"])
-    fdir = flavor_dir(flavor_name)
-    crypto = flavor_crypto_dir(flavor_name)
+        flavor = flavors[flavor_name]
+        source_id = flavor["source_cluster"]
+        src_primary = flavor["source_primary_subnet"]
+        src_secondary = flavor["source_secondary_subnet"]
+        memory_kib = flavor["memory_kib"]
+        vcpus = flavor["vcpus"]
+        etcd_image = flavor.get("etcd_image", ETCD_IMAGE)
+        disk_names = flavor.get("disks", ["disk-0.qcow2"])
+        fdir = flavor_dir(flavor_name)
+        crypto = flavor_crypto_dir(flavor_name)
 
-    clone_id = args.name or generate_clone_id()
-    if clone_id in state.get("clones", {}):
-        sys.exit(f"Clone '{clone_id}' already exists.")
+        clone_id = args.name or generate_clone_id()
+        if clone_id in state.get("clones", {}):
+            sys.exit(f"Clone '{clone_id}' already exists.")
 
-    subnet = allocate_subnet(state)
+        subnet = allocate_subnet(state)
+
     subnet_sec = subnet + SUBNET_SECONDARY_OFFSET
     mac1, mac2 = generate_mac(), generate_mac()
     vm_ip = f"192.168.{subnet}.{VM_IP_SUFFIX}"
@@ -704,17 +729,17 @@ def cmd_boot(args):
             sys.exit(f"Command failed: {e.cmd}\n{e.stderr or e.stdout or ''}")
         raise
 
-    state["clones"][clone_id] = {
-        "flavor": flavor_name,
-        "subnet_primary": subnet,
-        "subnet_secondary": subnet_sec,
-        "vm_name": vm_name,
-        "overlay_disks": overlays,
-        "mac_primary": mac1,
-        "mac_secondary": mac2,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    save_state(state)
+    with locked_state() as state:
+        state["clones"][clone_id] = {
+            "flavor": flavor_name,
+            "subnet_primary": subnet,
+            "subnet_secondary": subnet_sec,
+            "vm_name": vm_name,
+            "overlay_disks": overlays,
+            "mac_primary": mac1,
+            "mac_secondary": mac2,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     print(f'\nCluster "{clone_id}" ready!')
     print(f"  API:        https://api.{domain}:6443")
@@ -827,17 +852,17 @@ def cmd_verify(args):
 
 
 def cmd_flavors(args):
-    state = load_state()
     if args.delete:
         name = args.delete
-        if name in state["flavors"]:
-            ssh_baremetal(f"rm -rf {flavor_dir(name)}", check=False)
-            del state["flavors"][name]
-            save_state(state)
-            print(f'Flavor "{name}" deleted.')
-        else:
-            print(f'Flavor "{name}" not found.')
+        with locked_state() as state:
+            if name in state["flavors"]:
+                ssh_baremetal(f"rm -rf {flavor_dir(name)}", check=False)
+                del state["flavors"][name]
+                print(f'Flavor "{name}" deleted.')
+            else:
+                print(f'Flavor "{name}" not found.')
         return
+    state = load_state()
     flavors = state.get("flavors", {})
     if not flavors:
         print("No flavors available. Run 'cluster-tool snapshot --name NAME --source CLUSTER_ID' to create one.")
@@ -883,10 +908,10 @@ def cmd_destroy(args):
         remove_haproxy_clone(cid)
         remove_dns_entry(cid)
         (KUBECONFIG_DIR / f"{cid}.kubeconfig").unlink(missing_ok=True)
-        state["clones"].pop(cid, None)
-        print(f'Clone "{cid}" destroyed.')
 
-    save_state(state)
+        with locked_state() as s:
+            s["clones"].pop(cid, None)
+        print(f'Clone "{cid}" destroyed.')
 
 
 def main():
