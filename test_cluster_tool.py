@@ -217,7 +217,16 @@ class TestTransactionalBoot(unittest.TestCase):
         self.assertLess(pri_net_destroy_idx, overlay_idx)
 
 
+    _MOCK_CO_JSON = json.dumps({"items": [
+        {"metadata": {"name": "test"}, "status": {"conditions": [
+            {"type": "Available", "status": "True"},
+            {"type": "Progressing", "status": "False"},
+            {"type": "Degraded", "status": "False"},
+        ]}}
+    ]})
+
     def _make_all_succeed_ssh(self):
+        mock_co = self._MOCK_CO_JSON
         def ssh(cmd, check=True):
             self.calls.append((cmd, check))
             r = MagicMock()
@@ -225,7 +234,11 @@ class TestTransactionalBoot(unittest.TestCase):
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
             elif "infrastructure cluster" in cmd:
-                r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443 test-infra-cluster-aabbccdd-xxxxx"
+                r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co
+            elif 'condition=\\"Ready\\"' in cmd or "Ready" in cmd:
+                r.stdout = "True"
             else:
                 r.stdout = "ok"
             r.stderr = ""
@@ -319,6 +332,7 @@ class TestTransactionalBoot(unittest.TestCase):
     @patch.object(ct, "write_remote_file")
     @patch.object(ct, "add_hosts_entries")
     def test_identity_mismatch_aborts_boot(self, *_):
+        mock_co = self._MOCK_CO_JSON
         def ssh_wrong_identity(cmd, check=True):
             self.calls.append((cmd, check))
             r = MagicMock()
@@ -326,7 +340,11 @@ class TestTransactionalBoot(unittest.TestCase):
             if "ingress-cn" in cmd:
                 r.stdout = "fake-ingress-cn"
             elif "infrastructure cluster" in cmd:
-                r.stdout = "https://api.test-infra-cluster-6ef80144.redhat.com:6443 test-infra-cluster-6e-g677f"
+                r.stdout = "https://api.test-infra-cluster-6ef80144.redhat.com:6443"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co
+            elif "Ready" in cmd:
+                r.stdout = "True"
             else:
                 r.stdout = "ok"
             r.stderr = ""

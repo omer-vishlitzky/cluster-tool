@@ -383,7 +383,7 @@ def cmd_boot(args):
     vm_name = f"test-infra-cluster-{clone_id}-master-0"
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
 
-    total = 8
+    total = 9
     print(f'Creating clone "{clone_id}"...')
     cleanup = []
 
@@ -528,11 +528,43 @@ def cmd_boot(args):
             sys.exit("Cluster not healthy after 10 minutes")
         print_step(6, total, "Waiting for cluster health", "done")
 
-        print_step(7, total, "Verifying cluster identity")
-        verify_cluster_identity(vm_ip, clone_id, domain)
-        print_step(7, total, "Verifying cluster identity", "done")
+        print_step(7, total, "Waiting for operators")
+        kc = f"/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
+        oc_vm = f"sudo oc --kubeconfig={kc} --insecure-skip-tls-verify"
+        for _ in range(60):
+            r = ssh_vm(vm_ip, f"{oc_vm} get nodes -o jsonpath='{{.items[0].status.conditions[?(@.type==\"Ready\")].status}}'", check=False)
+            if r.stdout.strip() == "True":
+                break
+            time.sleep(5)
+        else:
+            sys.exit("Node not Ready after 5 minutes")
+        for _ in range(120):
+            r = ssh_vm(vm_ip, f"{oc_vm} get co -o json", check=False)
+            if r.returncode == 0:
+                import json as _json
+                try:
+                    cos = _json.loads(r.stdout)
+                    items = cos.get("items", [])
+                    if items:
+                        all_ok = all(
+                            any(c["type"] == "Available" and c["status"] == "True" for c in co.get("status", {}).get("conditions", []))
+                            and not any(c["type"] == "Degraded" and c["status"] == "True" for c in co.get("status", {}).get("conditions", []))
+                            for co in items
+                        )
+                        if all_ok:
+                            break
+                except _json.JSONDecodeError:
+                    pass
+            time.sleep(10)
+        else:
+            sys.exit("Operators not healthy after 20 minutes")
+        print_step(7, total, "Waiting for operators", "done")
 
-        print_step(8, total, "Configuring access")
+        print_step(8, total, "Verifying cluster identity")
+        verify_cluster_identity(vm_ip, clone_id, domain)
+        print_step(8, total, "Verifying cluster identity", "done")
+
+        print_step(9, total, "Configuring access")
         kubeconfig_path = KUBECONFIG_DIR / f"{clone_id}.kubeconfig"
         KUBECONFIG_DIR.mkdir(parents=True, exist_ok=True)
         r = ssh_vm(vm_ip, "sudo cat /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
@@ -547,7 +579,7 @@ def cmd_boot(args):
         cleanup.append(lambda: remove_haproxy_clone(clone_id))
         add_hosts_entries(clone_id)
         cleanup.append(lambda: remove_hosts_entries(clone_id))
-        print_step(8, total, "Configuring access", "done")
+        print_step(9, total, "Configuring access", "done")
 
     except (SystemExit, subprocess.CalledProcessError) as e:
         print(f"\nBoot failed, rolling back...")
@@ -588,6 +620,94 @@ def cmd_list(args):
         subnet = f"192.168.{info['subnet_primary']}.0/24"
         created = info.get("created_at", "?")[:19]
         print(f"{cid:<14s} {subnet:<22s} {info['vm_name']:<50s} {created}")
+
+
+def cmd_verify(args):
+    state = load_state()
+    clone_id = args.name
+    if clone_id not in state.get("clones", {}):
+        sys.exit(f"Clone '{clone_id}' not found.")
+
+    info = state["clones"][clone_id]
+    vm_ip = f"192.168.{info['subnet_primary']}.{VM_IP_SUFFIX}"
+    kubeconfig_path = KUBECONFIG_DIR / f"{clone_id}.kubeconfig"
+    if not kubeconfig_path.exists():
+        sys.exit(f"Kubeconfig not found at {kubeconfig_path}")
+
+    print(f'Verifying clone "{clone_id}"...')
+    kc = f"/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
+    oc_vm = f"sudo oc --kubeconfig={kc} --insecure-skip-tls-verify"
+    ns = f"smoke-test-{clone_id}"
+
+    print_step(1, 4, "Checking operators")
+    r = ssh_vm(vm_ip, f"{oc_vm} get co -o json", check=False)
+    if r.returncode != 0:
+        sys.exit(f"Cannot reach API: {r.stderr.strip()}")
+    import json as _json
+    cos = _json.loads(r.stdout)
+    unhealthy = []
+    for co in cos.get("items", []):
+        name = co["metadata"]["name"]
+        conds = {c["type"]: c["status"] for c in co.get("status", {}).get("conditions", [])}
+        if conds.get("Available") != "True" or conds.get("Degraded") == "True":
+            unhealthy.append(name)
+    if unhealthy:
+        print_step(1, 4, "Checking operators", f"WARN: {len(unhealthy)} unhealthy")
+        for u in unhealthy:
+            print(f"    - {u}")
+    else:
+        print_step(1, 4, "Checking operators", f"done ({len(cos['items'])}/{len(cos['items'])})")
+
+    print_step(2, 4, "Deploying smoke test pod")
+    ssh_vm(vm_ip, f"{oc_vm} create namespace {ns} 2>/dev/null", check=False)
+    smoke_cmd = (
+        "nslookup kubernetes.default.svc.cluster.local > /dev/null 2>&1 && "
+        "echo DNS_CLUSTER=OK || echo DNS_CLUSTER=FAIL; "
+        "nslookup redhat.com > /dev/null 2>&1 && "
+        "echo DNS_EXTERNAL=OK || echo DNS_EXTERNAL=FAIL; "
+        "curl -sf --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "
+        "-H \"Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\" "
+        "https://kubernetes.default.svc/api?timeout=5s > /dev/null 2>&1 && "
+        "echo API_ACCESS=OK || echo API_ACCESS=FAIL; "
+        "echo SMOKE_DONE"
+    )
+    ssh_vm(vm_ip,
+        f"{oc_vm} run smoke-test -n {ns} --restart=Never "
+        f"--image=registry.access.redhat.com/ubi9/ubi-minimal:latest "
+        f"--command -- sh -c \"{smoke_cmd}\"",
+        check=False)
+    print_step(2, 4, "Deploying smoke test pod", "done")
+
+    print_step(3, 4, "Waiting for smoke test")
+    for _ in range(30):
+        r = ssh_vm(vm_ip, f"{oc_vm} get pod smoke-test -n {ns} -o jsonpath='{{.status.phase}}'", check=False)
+        if r.stdout.strip() in ("Succeeded", "Failed"):
+            break
+        time.sleep(5)
+    else:
+        ssh_vm(vm_ip, f"{oc_vm} delete namespace {ns}", check=False)
+        sys.exit("Smoke test pod did not complete in 2.5 minutes")
+
+    logs = ssh_vm(vm_ip, f"{oc_vm} logs smoke-test -n {ns}", check=False).stdout
+    ssh_vm(vm_ip, f"{oc_vm} delete namespace {ns}", check=False)
+    print_step(3, 4, "Waiting for smoke test", "done")
+
+    print_step(4, 4, "Results")
+    results = {}
+    for line in logs.strip().split("\n"):
+        if "=" in line:
+            k, v = line.strip().split("=", 1)
+            results[k] = v
+    all_ok = all(v == "OK" for k, v in results.items() if k != "SMOKE_DONE")
+    for k, v in results.items():
+        if k != "SMOKE_DONE":
+            status = "PASS" if v == "OK" else "FAIL"
+            print(f"    {k}: {status}")
+    if all_ok and "SMOKE_DONE" in results:
+        print_step(4, 4, "Results", "ALL PASSED")
+    else:
+        print_step(4, 4, "Results", "SOME FAILED")
+        sys.exit(1)
 
 
 def cmd_destroy(args):
@@ -635,12 +755,15 @@ def main():
 
     sub.add_parser("list", help="Show running clones")
 
+    verify_p = sub.add_parser("verify", help="Run smoke tests on a clone")
+    verify_p.add_argument("name", help="Clone ID to verify")
+
     destroy_p = sub.add_parser("destroy", help="Tear down a clone")
     destroy_p.add_argument("name", nargs="?", help="Clone ID to destroy")
     destroy_p.add_argument("--all", action="store_true", help="Destroy all clones")
 
     args = parser.parse_args()
-    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "destroy": cmd_destroy}
+    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "verify": cmd_verify, "destroy": cmd_destroy}
 
     if args.command not in cmds:
         parser.print_help()
