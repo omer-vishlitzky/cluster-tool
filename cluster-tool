@@ -173,7 +173,18 @@ def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
         </network>""")
 
 
-def gen_vm_xml(clone_id, overlay_disk, mac_primary, mac_secondary, memory_kib=67108864, vcpus=16):
+def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=67108864, vcpus=16):
+    if isinstance(overlay_disks, str):
+        overlay_disks = [overlay_disks]
+    disk_xml = ""
+    for i, overlay in enumerate(overlay_disks):
+        dev = f"sd{chr(97 + i)}"
+        disk_xml += (
+            f"\n            <disk type='file' device='disk'>"
+            f"\n              <driver name='qemu' type='qcow2'/>"
+            f"\n              <source file='{overlay}'/>"
+            f"\n              <target dev='{dev}' bus='scsi'/>"
+            f"\n            </disk>")
     return textwrap.dedent(f"""\
         <domain type='kvm'>
           <name>test-infra-cluster-{clone_id}-master-0</name>
@@ -191,12 +202,7 @@ def gen_vm_xml(clone_id, overlay_disk, mac_primary, mac_secondary, memory_kib=67
           <on_reboot>restart</on_reboot>
           <on_crash>destroy</on_crash>
           <devices>
-            <emulator>/usr/libexec/qemu-kvm</emulator>
-            <disk type='file' device='disk'>
-              <driver name='qemu' type='qcow2'/>
-              <source file='{overlay_disk}'/>
-              <target dev='sda' bus='scsi'/>
-            </disk>
+            <emulator>/usr/libexec/qemu-kvm</emulator>{disk_xml}
             <controller type='scsi' index='0' model='virtio-scsi'/>
             <interface type='network'>
               <mac address='{mac_primary}'/>
@@ -343,6 +349,10 @@ def cmd_snapshot(args):
     state = load_state()
     flavor_name = args.name
     source_id = args.source
+
+    if flavor_name in state.get("flavors", {}):
+        sys.exit(f"Flavor '{flavor_name}' already exists. Delete it first with 'cluster-tool flavors --delete {flavor_name}'.")
+
     vm_name = f"test-infra-cluster-{source_id}-master-0"
     fdir = flavor_dir(flavor_name)
     crypto = flavor_crypto_dir(flavor_name)
@@ -358,6 +368,8 @@ def cmd_snapshot(args):
     r = ssh_baremetal(f"virsh net-dumpxml test-infra-secondary-network-{source_id}")
     src_secondary_subnet = parse_subnet(r.stdout)
 
+    vm_ip = f"192.168.{src_primary_subnet}.{VM_IP_SUFFIX}"
+
     r = ssh_baremetal(f"virsh domstate {vm_name}")
     vm_state = r.stdout.strip()
     if vm_state != "running":
@@ -365,8 +377,17 @@ def cmd_snapshot(args):
 
     print(f"Creating snapshot flavor '{flavor_name}' from {vm_name}...")
 
-    print_step(1, 5, "Extracting crypto keys")
-    vm_ip = f"192.168.{src_primary_subnet}.{VM_IP_SUFFIX}"
+    print_step(1, 6, "Detecting etcd image")
+    etcd_r = ssh_vm(vm_ip,
+        "sudo python3 -c \""
+        "import json; "
+        "d=json.load(open('/etc/kubernetes/manifests/etcd-pod.yaml')); "
+        "print(next(c['image'] for c in d['spec']['containers'] if c['name']=='etcd'))\"",
+        check=False)
+    etcd_image = etcd_r.stdout.strip() if etcd_r.returncode == 0 and etcd_r.stdout.strip() else ETCD_IMAGE
+    print_step(1, 6, "Detecting etcd image", "done")
+
+    print_step(2, 6, "Extracting crypto keys")
     source_kc = f"/home/test/assisted-test-infra/build/kubeconfig/kubeconfig_test-infra-cluster-{source_id}"
     oc = f"KUBECONFIG={source_kc} oc --insecure-skip-tls-verify --server=https://{vm_ip}:6443"
     ssh_baremetal(f"mkdir -p {crypto}")
@@ -384,9 +405,9 @@ def cmd_snapshot(args):
     if not ingress_cn.stdout.strip():
         sys.exit("Failed to extract ingress operator CN")
     ssh_baremetal(f"echo '{ingress_cn.stdout.strip()}' > {crypto}/ingress-cn.txt")
-    print_step(1, 5, "Extracting crypto keys", "done")
+    print_step(2, 6, "Extracting crypto keys", "done")
 
-    print_step(2, 5, "Shutting down VM")
+    print_step(3, 6, "Shutting down VM")
     ssh_baremetal(f"virsh shutdown {vm_name}")
     for _ in range(60):
         r = ssh_baremetal(f"virsh domstate {vm_name}")
@@ -395,22 +416,22 @@ def cmd_snapshot(args):
         time.sleep(2)
     else:
         sys.exit("VM did not shut down in 2 minutes")
-    print_step(2, 5, "Shutting down VM", "done")
+    print_step(3, 6, "Shutting down VM", "done")
 
-    print_step(3, 5, "Creating directories")
+    print_step(4, 6, "Creating directories")
     ssh_baremetal(f"mkdir -p {fdir} {REMOTE_OVERLAYS}")
-    print_step(3, 5, "Creating directories", "done")
+    print_step(4, 6, "Creating directories", "done")
 
-    print_step(4, 5, f"Copying {len(disks)} disk(s)")
+    print_step(5, 6, f"Copying {len(disks)} disk(s)")
     for i, disk in enumerate(disks):
         dest = f"{fdir}/disk-{i}.qcow2"
         ssh_baremetal(f"cp --sparse=always {disk['path']} {dest}")
         ssh_baremetal(f"chown qemu:qemu {dest}")
-    print_step(4, 5, f"Copying {len(disks)} disk(s)", "done")
+    print_step(5, 6, f"Copying {len(disks)} disk(s)", "done")
 
-    print_step(5, 5, "Restarting source VM")
+    print_step(6, 6, "Restarting source VM")
     ssh_baremetal(f"virsh start {vm_name}")
-    print_step(5, 5, "Restarting source VM", "done")
+    print_step(6, 6, "Restarting source VM", "done")
 
     state["flavors"][flavor_name] = {
         "source_cluster": source_id,
@@ -419,6 +440,7 @@ def cmd_snapshot(args):
         "memory_kib": dominfo["memory_kib"],
         "vcpus": dominfo["vcpus"],
         "disks": [f"disk-{i}.qcow2" for i in range(len(disks))],
+        "etcd_image": etcd_image,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     save_state(state)
@@ -444,6 +466,7 @@ def cmd_boot(args):
     memory_kib = flavor["memory_kib"]
     vcpus = flavor["vcpus"]
     etcd_image = flavor.get("etcd_image", ETCD_IMAGE)
+    disk_names = flavor.get("disks", ["disk-0.qcow2"])
     fdir = flavor_dir(flavor_name)
     crypto = flavor_crypto_dir(flavor_name)
 
@@ -455,7 +478,6 @@ def cmd_boot(args):
     subnet_sec = subnet + SUBNET_SECONDARY_OFFSET
     mac1, mac2 = generate_mac(), generate_mac()
     vm_ip = f"192.168.{subnet}.{VM_IP_SUFFIX}"
-    overlay = f"{REMOTE_OVERLAYS}/{clone_id}.qcow2"
     vm_name = f"test-infra-cluster-{clone_id}-master-0"
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
 
@@ -464,11 +486,15 @@ def cmd_boot(args):
     cleanup = []
 
     try:
-        print_step(1, total, "Creating disk overlay")
-        ssh_baremetal(f"qemu-img create -f qcow2 -b {fdir}/disk-0.qcow2 -F qcow2 {overlay}")
-        ssh_baremetal(f"chown qemu:qemu {overlay}")
-        cleanup.append(lambda: ssh_baremetal(f"rm -f {overlay}", check=False))
-        print_step(1, total, "Creating disk overlay", "done")
+        print_step(1, total, f"Creating {len(disk_names)} disk overlay(s)")
+        overlays = []
+        for disk_name in disk_names:
+            overlay = f"{REMOTE_OVERLAYS}/{clone_id}-{disk_name}"
+            ssh_baremetal(f"qemu-img create -f qcow2 -b {fdir}/{disk_name} -F qcow2 {overlay}")
+            ssh_baremetal(f"chown qemu:qemu {overlay}")
+            cleanup.append(lambda o=overlay: ssh_baremetal(f"rm -f {o}", check=False))
+            overlays.append(overlay)
+        print_step(1, total, f"Creating {len(disk_names)} disk overlay(s)", "done")
 
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24")
         primary_xml = gen_primary_network_xml(clone_id, subnet, mac1)
@@ -487,7 +513,7 @@ def cmd_boot(args):
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24", "done")
 
         print_step(3, total, "Booting VM")
-        vm_xml = gen_vm_xml(clone_id, overlay, mac1, mac2, memory_kib=memory_kib, vcpus=vcpus)
+        vm_xml = gen_vm_xml(clone_id, overlays, mac1, mac2, memory_kib=memory_kib, vcpus=vcpus)
         write_remote_file(f"/tmp/vm-{clone_id}.xml", vm_xml)
         ssh_baremetal(f"virsh define /tmp/vm-{clone_id}.xml")
         cleanup.append(lambda: ssh_baremetal(f"virsh undefine {vm_name}", check=False))
@@ -690,7 +716,7 @@ def cmd_boot(args):
         "subnet_primary": subnet,
         "subnet_secondary": subnet_sec,
         "vm_name": vm_name,
-        "overlay_disk": overlay,
+        "overlay_disks": overlays,
         "mac_primary": mac1,
         "mac_secondary": mac2,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -710,12 +736,13 @@ def cmd_list(args):
     if not clones:
         print("No clones running.")
         return
-    print(f"{'NAME':<14s} {'SUBNET':<22s} {'VM':<50s} {'CREATED'}")
-    print("-" * 110)
+    print(f"{'NAME':<14s} {'FLAVOR':<15s} {'SUBNET':<22s} {'CREATED'}")
+    print("-" * 70)
     for cid, info in clones.items():
         subnet = f"192.168.{info['subnet_primary']}.0/24"
         created = info.get("created_at", "?")[:19]
-        print(f"{cid:<14s} {subnet:<22s} {info['vm_name']:<50s} {created}")
+        flavor = info.get("flavor", "?")
+        print(f"{cid:<14s} {flavor:<15s} {subnet:<22s} {created}")
 
 
 def cmd_verify(args):
@@ -847,7 +874,7 @@ def cmd_destroy(args):
 
     for cid in ids:
         vm = f"test-infra-cluster-{cid}-master-0"
-        overlay = f"{REMOTE_OVERLAYS}/{cid}.qcow2"
+        clone_info = state.get("clones", {}).get(cid, {})
         print(f'Destroying clone "{cid}"...')
 
         ssh_baremetal(f"virsh destroy {vm}", check=False)
@@ -856,7 +883,9 @@ def cmd_destroy(args):
         ssh_baremetal(f"virsh net-undefine test-infra-net-{cid}", check=False)
         ssh_baremetal(f"virsh net-destroy test-infra-secondary-network-{cid}", check=False)
         ssh_baremetal(f"virsh net-undefine test-infra-secondary-network-{cid}", check=False)
-        ssh_baremetal(f"rm -f {overlay}", check=False)
+        for overlay in clone_info.get("overlay_disks", []):
+            ssh_baremetal(f"rm -f {overlay}", check=False)
+        ssh_baremetal(f"rm -f {REMOTE_OVERLAYS}/{cid}-*.qcow2", check=False)
 
         remove_haproxy_clone(cid)
         remove_dns_entry(cid)

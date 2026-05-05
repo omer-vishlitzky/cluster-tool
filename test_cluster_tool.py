@@ -81,7 +81,7 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("192.168.178.10", xml)
         self.assertIn("192.168.160.10", xml)  # DNS points to primary VIP
 
-    def test_vm_xml(self):
+    def test_vm_xml_single_disk(self):
         xml = ct.gen_vm_xml("a1b2c3d4", "/path/overlay.qcow2", "02:00:00:aa:bb:cc", "02:00:00:dd:ee:ff")
         self.assertIn("<name>test-infra-cluster-a1b2c3d4-master-0</name>", xml)
         self.assertIn("/path/overlay.qcow2", xml)
@@ -90,6 +90,17 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("test-infra-net-a1b2c3d4", xml)
         self.assertIn("test-infra-secondary-network-a1b2c3d4", xml)
         self.assertIn("67108864", xml)
+        self.assertIn("sda", xml)
+
+    def test_vm_xml_multi_disk(self):
+        xml = ct.gen_vm_xml("a1b2c3d4", ["/path/disk-0.qcow2", "/path/disk-1.qcow2"],
+                             "02:00:00:aa:bb:cc", "02:00:00:dd:ee:ff", 33554432, 8)
+        self.assertIn("/path/disk-0.qcow2", xml)
+        self.assertIn("/path/disk-1.qcow2", xml)
+        self.assertIn("sda", xml)
+        self.assertIn("sdb", xml)
+        self.assertIn("33554432", xml)
+        self.assertIn("8</vcpu>", xml)
 
     def test_haproxy_additions(self):
         use_backends, backends = ct.gen_haproxy_additions("a1b2c3d4", 160)
