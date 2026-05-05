@@ -640,6 +640,46 @@ class TestFlavorState(unittest.TestCase):
         self.assertEqual(loaded["flavors"]["sno-64"]["vcpus"], 16)
 
 
+class TestLocking(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        ct.LOCAL_STATE_FILE = Path(os.path.join(self.tmpdir, "state.json"))
+        ct.LOCAL_STATE_DIR = Path(self.tmpdir)
+
+    def test_locked_state_saves_on_success(self):
+        ct.save_state({"flavors": {}, "clones": {}, "next_subnet": 160})
+        with ct.locked_state() as state:
+            state["clones"]["test1"] = {"subnet_primary": 160}
+        loaded = ct.load_state()
+        self.assertIn("test1", loaded["clones"])
+
+    def test_locked_state_does_not_save_on_exception(self):
+        ct.save_state({"flavors": {}, "clones": {}, "next_subnet": 160})
+        with self.assertRaises(ValueError):
+            with ct.locked_state() as state:
+                state["clones"]["test1"] = {"subnet_primary": 160}
+                raise ValueError("boom")
+        loaded = ct.load_state()
+        self.assertNotIn("test1", loaded["clones"])
+
+    def test_locked_state_serializes_subnet_allocation(self):
+        ct.save_state({"flavors": {}, "clones": {}, "next_subnet": 160})
+        with ct.locked_state() as state:
+            s1 = ct.allocate_subnet(state)
+        with ct.locked_state() as state:
+            s2 = ct.allocate_subnet(state)
+        self.assertEqual(s1, 160)
+        self.assertEqual(s2, 161)
+
+    def test_locked_state_creates_lock_file(self):
+        ct.save_state({"flavors": {}, "clones": {}, "next_subnet": 160})
+        with ct.locked_state() as state:
+            self.assertTrue((Path(self.tmpdir) / "state.lock").exists())
+
+    def test_locked_haproxy_creates_lock_file(self):
+        with ct.locked_haproxy():
+            self.assertTrue((Path(self.tmpdir) / "haproxy.lock").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
