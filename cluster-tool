@@ -10,6 +10,7 @@ import textwrap
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 BAREMETAL_HOST = "root@rdu-infra-edge-07.infra-edge.lab.eng.rdu2.redhat.com"
 BAREMETAL_IP = "10.1.155.16"
@@ -61,6 +62,47 @@ def generate_mac():
     return "02:00:00:{:02x}:{:02x}:{:02x}".format(
         random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)
     )
+
+
+def parse_dominfo(dominfo_output):
+    result = {}
+    for line in dominfo_output.strip().split("\n"):
+        if "CPU(s):" in line:
+            result["vcpus"] = int(line.split(":")[1].strip())
+        elif "Max memory:" in line:
+            result["memory_kib"] = int(line.split(":")[1].strip().split()[0])
+    return result
+
+
+def parse_disk_paths(dumpxml_output, pool_name):
+    root = ET.fromstring(dumpxml_output)
+    disks = []
+    for disk in root.findall(".//disk"):
+        if disk.get("device") == "cdrom":
+            continue
+        target = disk.find("target")
+        source = disk.find("source")
+        if target is None or source is None:
+            continue
+        path = None
+        if source.get("file"):
+            path = source.get("file")
+        elif source.get("pool") and source.get("volume"):
+            r = ssh_baremetal(f"virsh vol-path --pool {source.get('pool')} {source.get('volume')}")
+            path = r.stdout.strip()
+        if path:
+            disks.append({"target": target.get("dev"), "path": path})
+    disks.sort(key=lambda d: d["target"])
+    return disks
+
+
+def parse_subnet(net_xml):
+    root = ET.fromstring(net_xml)
+    ip_elem = root.find(".//ip[@family='ipv4']")
+    if ip_elem is None:
+        ip_elem = root.find(".//ip")
+    addr = ip_elem.get("address")
+    return int(addr.split(".")[2])
 
 
 def gen_primary_network_xml(clone_id, subnet, mac):

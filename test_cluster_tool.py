@@ -544,5 +544,58 @@ class TestTransactionalBoot(unittest.TestCase):
         kubeconfig.unlink(missing_ok=True)
 
 
+class TestDetectSourceVM(unittest.TestCase):
+    def test_parse_dominfo(self):
+        dominfo = """Id:             90
+Name:           test-infra-cluster-6ef80144-master-0
+UUID:           bd3a9dd8-cc6b-4aae-8ba0-ca4b1c6b238d
+OS Type:        hvm
+State:          running
+CPU(s):         16
+Max memory:     67108864 KiB
+Used memory:    67108864 KiB"""
+        result = ct.parse_dominfo(dominfo)
+        self.assertEqual(result["vcpus"], 16)
+        self.assertEqual(result["memory_kib"], 67108864)
+
+    @patch.object(ct, "ssh_baremetal")
+    def test_parse_disk_paths(self, mock_ssh):
+        mock_ssh.return_value = MagicMock(stdout="/resolved/pool/disk-0\n")
+        dumpxml = """<domain type='kvm'>
+          <devices>
+            <disk type='volume' device='disk'>
+              <source pool='test-pool' volume='disk-0'/>
+              <target dev='sda' bus='scsi'/>
+            </disk>
+            <disk type='file' device='cdrom'>
+              <source file='/tmp/installer.iso'/>
+              <target dev='vdz' bus='scsi'/>
+              <readonly/>
+            </disk>
+            <disk type='file' device='disk'>
+              <source file='/data/extra-disk.qcow2'/>
+              <target dev='sdb' bus='scsi'/>
+            </disk>
+          </devices>
+        </domain>"""
+        disks = ct.parse_disk_paths(dumpxml, "test-pool")
+        self.assertEqual(len(disks), 2)
+        self.assertEqual(disks[0]["target"], "sda")
+        self.assertEqual(disks[0]["path"], "/resolved/pool/disk-0")
+        self.assertEqual(disks[1]["target"], "sdb")
+        self.assertEqual(disks[1]["path"], "/data/extra-disk.qcow2")
+
+    def test_parse_subnet(self):
+        net_xml = """<network>
+          <ip family='ipv4' address='192.168.135.1' prefix='24'>
+            <dhcp>
+              <host mac='02:00:00:02:4D:52' ip='192.168.135.10'/>
+            </dhcp>
+          </ip>
+        </network>"""
+        subnet = ct.parse_subnet(net_xml)
+        self.assertEqual(subnet, 135)
+
+
 if __name__ == "__main__":
     unittest.main()
