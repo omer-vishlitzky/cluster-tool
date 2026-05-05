@@ -528,58 +528,77 @@ def cmd_boot(args):
             sys.exit("Cluster not healthy after 10 minutes")
         print_step(6, total, "Waiting for cluster health", "done")
 
-        print_step(7, total, "Waiting for operators")
-        kc = f"/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
-        oc_vm = f"sudo oc --kubeconfig={kc} --insecure-skip-tls-verify"
-        for _ in range(60):
-            r = ssh_vm(vm_ip, f"{oc_vm} get nodes -o jsonpath='{{.items[0].status.conditions[?(@.type==\"Ready\")].status}}'", check=False)
-            if r.stdout.strip() == "True":
-                break
-            time.sleep(5)
-        else:
-            sys.exit("Node not Ready after 5 minutes")
-        for _ in range(120):
-            r = ssh_vm(vm_ip, f"{oc_vm} get co -o json", check=False)
-            if r.returncode == 0:
-                import json as _json
-                try:
-                    cos = _json.loads(r.stdout)
-                    items = cos.get("items", [])
-                    if items:
-                        all_ok = all(
-                            any(c["type"] == "Available" and c["status"] == "True" for c in co.get("status", {}).get("conditions", []))
-                            and not any(c["type"] == "Degraded" and c["status"] == "True" for c in co.get("status", {}).get("conditions", []))
-                            for co in items
-                        )
-                        if all_ok:
-                            break
-                except _json.JSONDecodeError:
-                    pass
-            time.sleep(10)
-        else:
-            sys.exit("Operators not healthy after 20 minutes")
-        print_step(7, total, "Waiting for operators", "done")
-
-        print_step(8, total, "Verifying cluster identity")
-        verify_cluster_identity(vm_ip, clone_id, domain)
-        print_step(8, total, "Verifying cluster identity", "done")
-
-        print_step(9, total, "Configuring access")
+        print_step(7, total, "Configuring access")
         kubeconfig_path = KUBECONFIG_DIR / f"{clone_id}.kubeconfig"
         KUBECONFIG_DIR.mkdir(parents=True, exist_ok=True)
         r = ssh_vm(vm_ip, "sudo cat /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
         kubeconfig_path.write_text(r.stdout)
 
-        kc = kubeconfig_path.read_text()
-        kc = kc.replace(f"https://{vm_ip}:6443", f"https://api.{domain}:6443")
-        kubeconfig_path.write_text(kc)
+        kc_content = kubeconfig_path.read_text()
+        kc_content = kc_content.replace(f"https://{vm_ip}:6443", f"https://api.{domain}:6443")
+        kubeconfig_path.write_text(kc_content)
         cleanup.append(lambda: kubeconfig_path.unlink(missing_ok=True))
 
         add_haproxy_clone(clone_id, subnet)
         cleanup.append(lambda: remove_haproxy_clone(clone_id))
         add_hosts_entries(clone_id)
         cleanup.append(lambda: remove_hosts_entries(clone_id))
-        print_step(9, total, "Configuring access", "done")
+        print_step(7, total, "Configuring access", "done")
+
+        print(f"\n  Kubeconfig available at: {kubeconfig_path}")
+        print(f"  export KUBECONFIG={kubeconfig_path}\n")
+
+        print_step(8, total, "Waiting for operators")
+        kc_path = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
+        oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
+        node_ready = False
+        for _ in range(60):
+            r = ssh_vm(vm_ip, f"{oc_vm} get nodes -o json", check=False)
+            if r.returncode == 0:
+                try:
+                    nodes = json.loads(r.stdout)
+                    for node in nodes.get("items", []):
+                        for cond in node.get("status", {}).get("conditions", []):
+                            if cond["type"] == "Ready" and cond["status"] == "True":
+                                node_ready = True
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            if node_ready:
+                break
+            time.sleep(5)
+        else:
+            r = ssh_vm(vm_ip, f"{oc_vm} get nodes -o wide", check=False)
+            sys.exit(f"Node not Ready after 5 minutes.\n{r.stdout}\n{r.stderr}")
+        last_unhealthy = []
+        for attempt in range(120):
+            r = ssh_vm(vm_ip, f"{oc_vm} get co -o json", check=False)
+            if r.returncode == 0:
+                try:
+                    cos = json.loads(r.stdout)
+                    items = cos.get("items", [])
+                    if items:
+                        last_unhealthy = []
+                        for co in items:
+                            name = co["metadata"]["name"]
+                            conds = {c["type"]: c["status"] for c in co.get("status", {}).get("conditions", [])}
+                            if conds.get("Available") != "True" or conds.get("Degraded") == "True":
+                                msg = next((c.get("message", "") for c in co.get("status", {}).get("conditions", []) if c["type"] == "Degraded" and c["status"] == "True"), "")
+                                if not msg:
+                                    msg = next((c.get("message", "") for c in co.get("status", {}).get("conditions", []) if c["type"] == "Available" and c["status"] != "True"), "")
+                                last_unhealthy.append(f"{name}: {msg[:120]}")
+                        if not last_unhealthy:
+                            break
+                except json.JSONDecodeError:
+                    pass
+            time.sleep(10)
+        else:
+            detail = "\n".join(f"  - {u}" for u in last_unhealthy)
+            sys.exit(f"Operators not healthy after 20 minutes.\nUnhealthy operators:\n{detail}")
+        print_step(8, total, "Waiting for operators", f"done ({len(items)}/{len(items)})")
+
+        print_step(9, total, "Verifying cluster identity")
+        verify_cluster_identity(vm_ip, clone_id, domain)
+        print_step(9, total, "Verifying cluster identity", "done")
 
     except (SystemExit, subprocess.CalledProcessError) as e:
         print(f"\nBoot failed, rolling back...")

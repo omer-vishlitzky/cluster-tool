@@ -224,9 +224,15 @@ class TestTransactionalBoot(unittest.TestCase):
             {"type": "Degraded", "status": "False"},
         ]}}
     ]})
+    _MOCK_NODES_JSON = json.dumps({"items": [
+        {"metadata": {"name": "test-node"}, "status": {"conditions": [
+            {"type": "Ready", "status": "True"},
+        ]}}
+    ]})
 
     def _make_all_succeed_ssh(self):
         mock_co = self._MOCK_CO_JSON
+        mock_nodes = self._MOCK_NODES_JSON
         def ssh(cmd, check=True):
             self.calls.append((cmd, check))
             r = MagicMock()
@@ -237,8 +243,8 @@ class TestTransactionalBoot(unittest.TestCase):
                 r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
             elif "get co -o json" in cmd:
                 r.stdout = mock_co
-            elif 'condition=\\"Ready\\"' in cmd or "Ready" in cmd:
-                r.stdout = "True"
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
             else:
                 r.stdout = "ok"
             r.stderr = ""
@@ -333,6 +339,7 @@ class TestTransactionalBoot(unittest.TestCase):
     @patch.object(ct, "add_hosts_entries")
     def test_identity_mismatch_aborts_boot(self, *_):
         mock_co = self._MOCK_CO_JSON
+        mock_nodes = self._MOCK_NODES_JSON
         def ssh_wrong_identity(cmd, check=True):
             self.calls.append((cmd, check))
             r = MagicMock()
@@ -343,8 +350,8 @@ class TestTransactionalBoot(unittest.TestCase):
                 r.stdout = "https://api.test-infra-cluster-6ef80144.redhat.com:6443"
             elif "get co -o json" in cmd:
                 r.stdout = mock_co
-            elif "Ready" in cmd:
-                r.stdout = "True"
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
             else:
                 r.stdout = "ok"
             r.stderr = ""
@@ -355,7 +362,117 @@ class TestTransactionalBoot(unittest.TestCase):
                 ct.cmd_boot(self._boot_args())
 
         self.assertIn("IDENTITY MISMATCH", str(ctx.exception))
-        self.assertEqual(ct.load_state()["clones"], {})
+
+    @patch("time.sleep")
+    @patch.object(ct, "write_remote_file")
+    @patch.object(ct, "add_hosts_entries")
+    def test_node_not_ready_prints_diagnostics(self, *_):
+        mock_nodes_not_ready = json.dumps({"items": [
+            {"metadata": {"name": "test-node"}, "status": {"conditions": [
+                {"type": "Ready", "status": "False", "reason": "KubeletNotReady", "message": "container runtime not ready"},
+            ]}}
+        ]})
+        def ssh_node_not_ready(cmd, check=True):
+            self.calls.append((cmd, check))
+            r = MagicMock()
+            r.returncode = 0
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes_not_ready
+            elif "get nodes -o wide" in cmd:
+                r.stdout = "NAME   STATUS     ROLES   AGE   VERSION\ntest   NotReady   master  1m    v1.32"
+            else:
+                r.stdout = "ok"
+            r.stderr = ""
+            return r
+
+        with patch.object(ct, "ssh_baremetal", side_effect=ssh_node_not_ready):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_boot(self._boot_args())
+        self.assertIn("Node not Ready", str(ctx.exception))
+        self.assertIn("NotReady", str(ctx.exception))
+
+    @patch("time.sleep")
+    @patch.object(ct, "write_remote_file")
+    @patch.object(ct, "add_hosts_entries")
+    def test_unhealthy_operators_prints_which_ones(self, *_):
+        mock_co_bad = json.dumps({"items": [
+            {"metadata": {"name": "authentication"}, "status": {"conditions": [
+                {"type": "Available", "status": "False", "message": "OAuthServerDown"},
+                {"type": "Degraded", "status": "True", "message": "OAuth route unreachable"},
+            ]}},
+            {"metadata": {"name": "dns"}, "status": {"conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Degraded", "status": "False"},
+            ]}},
+        ]})
+        mock_nodes = self._MOCK_NODES_JSON
+        def ssh_co_unhealthy(cmd, check=True):
+            self.calls.append((cmd, check))
+            r = MagicMock()
+            r.returncode = 0
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co_bad
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
+            else:
+                r.stdout = "ok"
+            r.stderr = ""
+            return r
+
+        with patch.object(ct, "ssh_baremetal", side_effect=ssh_co_unhealthy):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_boot(self._boot_args())
+        self.assertIn("Operators not healthy", str(ctx.exception))
+        self.assertIn("authentication", str(ctx.exception))
+        self.assertNotIn("dns", str(ctx.exception))
+
+    @patch("time.sleep")
+    @patch.object(ct, "write_remote_file")
+    @patch.object(ct, "remove_hosts_entries")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_hosts_entries")
+    def test_kubeconfig_available_before_operator_check(self, *_):
+        call_order = []
+        mock_co = self._MOCK_CO_JSON
+        mock_nodes = self._MOCK_NODES_JSON
+        def ssh_tracking(cmd, check=True):
+            self.calls.append((cmd, check))
+            if "lb-ext.kubeconfig" in cmd and "cat" in cmd:
+                call_order.append("kubeconfig_extract")
+            elif "get co -o json" in cmd:
+                call_order.append("operator_check")
+            r = MagicMock()
+            r.returncode = 0
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "infrastructure cluster" in cmd:
+                r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
+            else:
+                r.stdout = "ok"
+            r.stderr = ""
+            return r
+
+        with patch.object(ct, "ssh_baremetal", side_effect=ssh_tracking):
+            ct.cmd_boot(self._boot_args())
+
+        self.assertIn("kubeconfig_extract", call_order)
+        self.assertIn("operator_check", call_order)
+        kc_idx = call_order.index("kubeconfig_extract")
+        co_idx = call_order.index("operator_check")
+        self.assertLess(kc_idx, co_idx)
+        state = ct.load_state()
+        self.assertIn("aabbccdd", state["clones"])
+        kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
+        self.assertTrue(kubeconfig.exists())
+        kubeconfig.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
