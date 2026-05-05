@@ -47,7 +47,6 @@ The tool uses the same certificate regeneration mechanism as Red Hat's [Image Ba
 
 # Boot a fresh cluster (~5 min)
 ./cluster-tool boot --name my-test
-# Follow the printed instructions to add /etc/hosts entries
 
 # Use it
 export KUBECONFIG=~/.kube/my-test.kubeconfig
@@ -87,7 +86,7 @@ oc get nodes
 6. **Wait for health** — poll `/healthz` until the API server is ready.
 7. **Wait for operators** — poll all ClusterOperators until they are Available and not Degraded.
 8. **Verify identity** — confirm the infrastructure resource has the correct API URL (prevents accidental source cluster corruption).
-9. **Configure access** — extract kubeconfig, add HAProxy SNI entries, print /etc/hosts commands.
+9. **Configure access** — extract kubeconfig, add HAProxy SNI entries, add dnsmasq DNS entry.
 
 If any step fails, all previously created resources are rolled back automatically (transactional boot).
 
@@ -133,6 +132,19 @@ Each clone gets a fully unique identity through recert:
 - HAProxy configured with SNI routing on the baremetal host
 - Python 3 on your laptop (stdlib only, no pip dependencies)
 - `oc` CLI on the baremetal host
+- dnsmasq (installed via package manager)
+
+## One-Time Setup
+
+Run once to enable automatic DNS resolution for cloned clusters:
+
+```bash
+./setup.sh
+```
+
+This configures dnsmasq as NetworkManager's DNS backend, grants your user permission to reload NM without sudo, and verifies everything works. Requires sudo during setup, never again after.
+
+After this, `cluster-tool boot` handles DNS automatically — no manual `/etc/hosts` entries, no sudo.
 
 ## Reliability
 

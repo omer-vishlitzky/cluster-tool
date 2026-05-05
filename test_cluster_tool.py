@@ -1,10 +1,14 @@
 # test_cluster_tool.py
+import argparse
 import importlib.machinery
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 loader = importlib.machinery.SourceFileLoader("cluster_tool", "./cluster-tool")
 spec = importlib.util.spec_from_loader("cluster_tool", loader, origin="./cluster-tool")
@@ -96,19 +100,84 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("192.168.160.10:443", backends)
         self.assertIn("192.168.160.10:80", backends)
 
-    def test_hosts_block(self):
-        block = ct.gen_hosts_block("a1b2c3d4")
-        self.assertIn("cluster-tool:begin:a1b2c3d4", block)
-        self.assertIn("cluster-tool:end:a1b2c3d4", block)
-        self.assertIn("10.1.155.16 api.test-infra-cluster-a1b2c3d4.redhat.com", block)
-        self.assertIn("console-openshift-console.apps.test-infra-cluster-a1b2c3d4.redhat.com", block)
-        self.assertEqual(block.count("10.1.155.16"), len(ct.HOSTS_ENTRIES))
+    def test_dnsmasq_conf(self):
+        conf = ct.gen_dnsmasq_conf("a1b2c3d4")
+        self.assertEqual(conf, "address=/test-infra-cluster-a1b2c3d4.redhat.com/10.1.155.16\n")
+
+    def test_dnsmasq_conf_resolves_all_subdomains(self):
+        conf = ct.gen_dnsmasq_conf("mytest")
+        self.assertIn("address=/test-infra-cluster-mytest.redhat.com/", conf)
+        self.assertNotIn("api.", conf)
+        self.assertNotIn("apps.", conf)
+
+    def test_dnsmasq_conf_uses_baremetal_ip(self):
+        conf = ct.gen_dnsmasq_conf("xyz")
+        self.assertIn(ct.BAREMETAL_IP, conf)
+
+    def test_dnsmasq_conf_different_ids_produce_different_configs(self):
+        conf1 = ct.gen_dnsmasq_conf("aaaa")
+        conf2 = ct.gen_dnsmasq_conf("bbbb")
+        self.assertNotEqual(conf1, conf2)
+        self.assertIn("aaaa", conf1)
+        self.assertIn("bbbb", conf2)
 
 
-import argparse
-import subprocess
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+class TestDnsEntry(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_dnsmasq_dir = ct.DNSMASQ_DIR
+        ct.DNSMASQ_DIR = Path(self.tmpdir)
+
+    def tearDown(self):
+        ct.DNSMASQ_DIR = self._orig_dnsmasq_dir
+
+    @patch("subprocess.run")
+    def test_add_dns_entry_creates_file(self, mock_run):
+        ct.add_dns_entry("test01")
+        conf = Path(self.tmpdir) / "cluster-test01.conf"
+        self.assertTrue(conf.exists())
+        self.assertIn("test-infra-cluster-test01.redhat.com", conf.read_text())
+
+    @patch("subprocess.run")
+    def test_add_dns_entry_reloads_nm(self, mock_run):
+        ct.add_dns_entry("test01")
+        mock_run.assert_called_once_with(["nmcli", "general", "reload"], check=True)
+
+    @patch("subprocess.run")
+    def test_add_dns_entry_is_idempotent(self, mock_run):
+        ct.add_dns_entry("test01")
+        content1 = (Path(self.tmpdir) / "cluster-test01.conf").read_text()
+        ct.add_dns_entry("test01")
+        content2 = (Path(self.tmpdir) / "cluster-test01.conf").read_text()
+        self.assertEqual(content1, content2)
+
+    @patch("subprocess.run")
+    def test_remove_dns_entry_deletes_file(self, mock_run):
+        conf = Path(self.tmpdir) / "cluster-test01.conf"
+        conf.write_text("address=/test.redhat.com/10.1.155.16\n")
+        ct.remove_dns_entry("test01")
+        self.assertFalse(conf.exists())
+
+    @patch("subprocess.run")
+    def test_remove_dns_entry_reloads_nm(self, mock_run):
+        conf = Path(self.tmpdir) / "cluster-test01.conf"
+        conf.write_text("test")
+        ct.remove_dns_entry("test01")
+        mock_run.assert_called_once_with(["nmcli", "general", "reload"], check=False)
+
+    @patch("subprocess.run")
+    def test_remove_dns_entry_missing_file_no_error(self, mock_run):
+        ct.remove_dns_entry("nonexistent")
+
+    @patch("subprocess.run")
+    def test_multiple_clones_separate_files(self, mock_run):
+        ct.add_dns_entry("clone1")
+        ct.add_dns_entry("clone2")
+        self.assertTrue((Path(self.tmpdir) / "cluster-clone1.conf").exists())
+        self.assertTrue((Path(self.tmpdir) / "cluster-clone2.conf").exists())
+        ct.remove_dns_entry("clone1")
+        self.assertFalse((Path(self.tmpdir) / "cluster-clone1.conf").exists())
+        self.assertTrue((Path(self.tmpdir) / "cluster-clone2.conf").exists())
 
 
 class TestTransactionalBoot(unittest.TestCase):
@@ -152,7 +221,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     @patch.object(ct, "scp_from_baremetal")
     def test_failure_at_network_cleans_overlay(self, *_):
         with patch.object(ct, "ssh_baremetal", side_effect=self._make_ssh_mock("virsh net-define /tmp/net-")):
@@ -166,7 +235,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     @patch.object(ct, "scp_from_baremetal")
     def test_failure_at_vm_cleans_overlay_and_networks(self, *_):
         with patch.object(ct, "ssh_baremetal", side_effect=self._make_ssh_mock("virsh define /tmp/vm-")):
@@ -182,7 +251,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     @patch.object(ct, "scp_from_baremetal")
     def test_failure_at_recert_cleans_everything(self, *_):
         with patch.object(ct, "ssh_baremetal", side_effect=self._make_ssh_mock("podman run --rm --name recert")):
@@ -198,7 +267,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     @patch.object(ct, "scp_from_baremetal")
     def test_cleanup_runs_in_reverse_order(self, *_):
         with patch.object(ct, "ssh_baremetal", side_effect=self._make_ssh_mock("podman run --rm --name recert")):
@@ -253,7 +322,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "remove_hosts_entries")
+    @patch.object(ct, "remove_dns_entry")
     def test_failure_at_hosts_rolls_back_haproxy(self, *_):
         haproxy_removed = []
 
@@ -261,7 +330,7 @@ class TestTransactionalBoot(unittest.TestCase):
             haproxy_removed.append(clone_id)
 
         with patch.object(ct, "ssh_baremetal", side_effect=self._make_all_succeed_ssh()), \
-             patch.object(ct, "add_hosts_entries", side_effect=subprocess.CalledProcessError(1, "sudo")), \
+             patch.object(ct, "add_dns_entry", side_effect=subprocess.CalledProcessError(1, "sudo")), \
              patch.object(ct, "remove_haproxy_clone", side_effect=track_remove_haproxy):
             with self.assertRaises(SystemExit):
                 ct.cmd_boot(self._boot_args())
@@ -273,7 +342,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     def test_called_process_error_triggers_rollback(self, *_):
         def ssh_fail_at_haproxy(cmd, check=True):
             self.calls.append((cmd, check))
@@ -297,9 +366,9 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "remove_hosts_entries")
+    @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     def test_success_saves_state(self, *_):
         with patch.object(ct, "ssh_baremetal", side_effect=self._make_all_succeed_ssh()):
             ct.cmd_boot(self._boot_args())
@@ -313,9 +382,9 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "remove_hosts_entries")
+    @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     def test_recert_uses_key_preservation(self, *_):
         with patch.object(ct, "ssh_baremetal", side_effect=self._make_all_succeed_ssh()):
             ct.cmd_boot(self._boot_args())
@@ -336,7 +405,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     def test_identity_mismatch_aborts_boot(self, *_):
         mock_co = self._MOCK_CO_JSON
         mock_nodes = self._MOCK_NODES_JSON
@@ -365,7 +434,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     def test_node_not_ready_prints_diagnostics(self, *_):
         mock_nodes_not_ready = json.dumps({"items": [
             {"metadata": {"name": "test-node"}, "status": {"conditions": [
@@ -395,7 +464,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     def test_unhealthy_operators_prints_which_ones(self, *_):
         mock_co_bad = json.dumps({"items": [
             {"metadata": {"name": "authentication"}, "status": {"conditions": [
@@ -432,9 +501,9 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
-    @patch.object(ct, "remove_hosts_entries")
+    @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
-    @patch.object(ct, "add_hosts_entries")
+    @patch.object(ct, "add_dns_entry")
     def test_kubeconfig_available_before_operator_check(self, *_):
         call_order = []
         mock_co = self._MOCK_CO_JSON

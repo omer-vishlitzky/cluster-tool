@@ -33,17 +33,7 @@ VM_VCPUS = 16
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
 RECERT_IMAGE = "quay.io/edge-infrastructure/recert:latest"
 ETCD_IMAGE = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:96e7c7f2ccac380f0b57c6b3be73c09df05d46b3ff7864acb1ba4fc063d72508"
-HOSTS_ENTRIES = [
-    "api.{domain}",
-    "apps.{domain}",
-    "console-openshift-console.apps.{domain}",
-    "oauth-openshift.apps.{domain}",
-    "downloads-openshift-console.apps.{domain}",
-    "alertmanager-main-openshift-monitoring.apps.{domain}",
-    "prometheus-k8s-openshift-monitoring.apps.{domain}",
-    "prometheus-k8s-federate-openshift-monitoring.apps.{domain}",
-    "thanos-querier-openshift-monitoring.apps.{domain}",
-]
+DNSMASQ_DIR = Path("/etc/NetworkManager/dnsmasq.d")
 
 
 def load_state():
@@ -192,13 +182,9 @@ def gen_haproxy_additions(clone_id, subnet):
     return use_backends, backends
 
 
-def gen_hosts_block(clone_id):
+def gen_dnsmasq_conf(clone_id):
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
-    lines = [f"# cluster-tool:begin:{clone_id}"]
-    for entry in HOSTS_ENTRIES:
-        lines.append(f"{BAREMETAL_IP} {entry.format(domain=domain)}")
-    lines.append(f"# cluster-tool:end:{clone_id}")
-    return "\n".join(lines)
+    return f"address=/{domain}/{BAREMETAL_IP}\n"
 
 
 def print_step(num, total, desc, status=""):
@@ -271,15 +257,16 @@ def remove_haproxy_clone(clone_id):
     ssh_baremetal("systemctl reload haproxy")
 
 
-def add_hosts_entries(clone_id):
-    block = gen_hosts_block(clone_id)
-    print(f"\n  Run this to add /etc/hosts entries:\n")
-    print(f"    sudo tee -a /etc/hosts <<'EOF'\n{block}\nEOF\n")
+def add_dns_entry(clone_id):
+    conf = DNSMASQ_DIR / f"cluster-{clone_id}.conf"
+    conf.write_text(gen_dnsmasq_conf(clone_id))
+    subprocess.run(["nmcli", "general", "reload"], check=True)
 
 
-def remove_hosts_entries(clone_id):
-    print(f"\n  Run this to remove /etc/hosts entries:\n")
-    print(f"    sudo sed -i '/cluster-tool:begin:{clone_id}/,/cluster-tool:end:{clone_id}/d' /etc/hosts\n")
+def remove_dns_entry(clone_id):
+    conf = DNSMASQ_DIR / f"cluster-{clone_id}.conf"
+    conf.unlink(missing_ok=True)
+    subprocess.run(["nmcli", "general", "reload"], check=False)
 
 
 def verify_cluster_identity(vm_ip, expected_id, expected_domain):
@@ -541,8 +528,8 @@ def cmd_boot(args):
 
         add_haproxy_clone(clone_id, subnet)
         cleanup.append(lambda: remove_haproxy_clone(clone_id))
-        add_hosts_entries(clone_id)
-        cleanup.append(lambda: remove_hosts_entries(clone_id))
+        add_dns_entry(clone_id)
+        cleanup.append(lambda: remove_dns_entry(clone_id))
         print_step(7, total, "Configuring access", "done")
 
         print(f"\n  Kubeconfig available at: {kubeconfig_path}")
@@ -755,7 +742,7 @@ def cmd_destroy(args):
         ssh_baremetal(f"rm -f {overlay}", check=False)
 
         remove_haproxy_clone(cid)
-        remove_hosts_entries(cid)
+        remove_dns_entry(cid)
         (KUBECONFIG_DIR / f"{cid}.kubeconfig").unlink(missing_ok=True)
         state["clones"].pop(cid, None)
         print(f'Clone "{cid}" destroyed.')
