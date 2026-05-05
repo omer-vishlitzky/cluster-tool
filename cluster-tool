@@ -42,14 +42,7 @@ DNSMASQ_DIR = Path("/etc/NetworkManager/dnsmasq.d")
 
 def load_state():
     if LOCAL_STATE_FILE.exists():
-        state = json.loads(LOCAL_STATE_FILE.read_text())
-        if "flavors" not in state:
-            state["flavors"] = {}
-            if state.get("snapshot"):
-                state["flavors"]["default"] = state.pop("snapshot")
-            else:
-                state.pop("snapshot", None)
-        return state
+        return json.loads(LOCAL_STATE_FILE.read_text())
     return {"flavors": {}, "clones": {}, "next_subnet": SUBNET_START}
 
 

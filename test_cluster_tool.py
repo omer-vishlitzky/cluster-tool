@@ -639,17 +639,6 @@ class TestFlavorState(unittest.TestCase):
         self.assertIn("sno-64", loaded["flavors"])
         self.assertEqual(loaded["flavors"]["sno-64"]["vcpus"], 16)
 
-    def test_backward_compat_old_state(self):
-        old_state = {
-            "snapshot": {"source_cluster": "6ef80144", "golden_snapshot": "/old/path"},
-            "clones": {},
-            "next_subnet": 165,
-        }
-        ct.save_state(old_state)
-        state = ct.load_state()
-        self.assertIn("flavors", state)
-        self.assertIn("default", state["flavors"])
-        self.assertEqual(state["next_subnet"], 165)
 
 
 if __name__ == "__main__":
