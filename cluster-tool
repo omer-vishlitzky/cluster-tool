@@ -405,8 +405,10 @@ def cmd_snapshot(args):
     print_step(1, 6, "Detecting etcd image", "done")
 
     print_step(2, 6, "Extracting crypto keys")
-    source_kc = f"/home/test/assisted-test-infra/build/kubeconfig/kubeconfig_test-infra-cluster-{source_id}"
-    oc = f"KUBECONFIG={source_kc} oc --insecure-skip-tls-verify --server=https://{vm_ip}:6443"
+    node_kc = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
+    temp_kc = f"/tmp/kubeconfig-{source_id}"
+    ssh_baremetal(f"ssh {' '.join(SSH_OPTS)} core@{vm_ip} 'sudo cat {node_kc}' > {temp_kc}")
+    oc = f"KUBECONFIG={temp_kc} oc --insecure-skip-tls-verify --server=https://{vm_ip}:6443"
     ssh_baremetal(f"mkdir -p {crypto}")
     for secret, ns, dest in [
         ("loadbalancer-serving-signer", "openshift-kube-apiserver-operator", "lb-signer.key"),
@@ -422,6 +424,7 @@ def cmd_snapshot(args):
     if not ingress_cn.stdout.strip():
         sys.exit("Failed to extract ingress operator CN")
     ssh_baremetal(f"echo '{ingress_cn.stdout.strip()}' > {crypto}/ingress-cn.txt")
+    ssh_baremetal(f"rm -f {temp_kc}")
     print_step(2, 6, "Extracting crypto keys", "done")
 
     print_step(3, 6, "Shutting down VM")
