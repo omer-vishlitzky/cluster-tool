@@ -14,14 +14,19 @@ import xml.etree.ElementTree as ET
 
 BAREMETAL_HOST = "root@rdu-infra-edge-07.infra-edge.lab.eng.rdu2.redhat.com"
 BAREMETAL_IP = "10.1.155.16"
-SOURCE_CLUSTER_ID = "6ef80144"
-SOURCE_DISK = "/data/test/assisted-test-infra/storage_pool/test-infra-cluster-6ef80144/test-infra-cluster-6ef80144-master-0-disk-0"
-SOURCE_PRIMARY_SUBNET = 135
-SOURCE_SECONDARY_SUBNET = 153
 REMOTE_BASE = "/data/cluster-tool"
-REMOTE_SNAPSHOT = f"{REMOTE_BASE}/golden-snapshot.qcow2"
 REMOTE_OVERLAYS = f"{REMOTE_BASE}/overlays"
-REMOTE_CRYPTO = f"{REMOTE_BASE}/crypto"
+REMOTE_FLAVORS = f"{REMOTE_BASE}/flavors"
+
+
+def flavor_dir(name):
+    return f"{REMOTE_FLAVORS}/{name}"
+
+
+def flavor_crypto_dir(name):
+    return f"{REMOTE_FLAVORS}/{name}/crypto"
+
+
 _REAL_HOME = Path(os.path.expanduser(f"~{os.environ.get('SUDO_USER', '')}"))
 LOCAL_STATE_DIR = _REAL_HOME / ".cluster-tool"
 LOCAL_STATE_FILE = LOCAL_STATE_DIR / "state.json"
@@ -29,8 +34,6 @@ KUBECONFIG_DIR = _REAL_HOME / ".kube"
 SUBNET_START = 160
 SUBNET_SECONDARY_OFFSET = 18
 VM_IP_SUFFIX = 10
-VM_MEMORY_KIB = 67108864
-VM_VCPUS = 16
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
 RECERT_IMAGE = "quay.io/edge-infrastructure/recert:latest"
 ETCD_IMAGE = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:96e7c7f2ccac380f0b57c6b3be73c09df05d46b3ff7864acb1ba4fc063d72508"
@@ -39,8 +42,15 @@ DNSMASQ_DIR = Path("/etc/NetworkManager/dnsmasq.d")
 
 def load_state():
     if LOCAL_STATE_FILE.exists():
-        return json.loads(LOCAL_STATE_FILE.read_text())
-    return {"snapshot": None, "clones": {}, "next_subnet": SUBNET_START}
+        state = json.loads(LOCAL_STATE_FILE.read_text())
+        if "flavors" not in state:
+            state["flavors"] = {}
+            if state.get("snapshot"):
+                state["flavors"]["default"] = state.pop("snapshot")
+            else:
+                state.pop("snapshot", None)
+        return state
+    return {"flavors": {}, "clones": {}, "next_subnet": SUBNET_START}
 
 
 def save_state(state):
@@ -163,13 +173,13 @@ def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
         </network>""")
 
 
-def gen_vm_xml(clone_id, overlay_disk, mac_primary, mac_secondary):
+def gen_vm_xml(clone_id, overlay_disk, mac_primary, mac_secondary, memory_kib=67108864, vcpus=16):
     return textwrap.dedent(f"""\
         <domain type='kvm'>
           <name>test-infra-cluster-{clone_id}-master-0</name>
-          <memory unit='KiB'>{VM_MEMORY_KIB}</memory>
-          <currentMemory unit='KiB'>{VM_MEMORY_KIB}</currentMemory>
-          <vcpu placement='static'>{VM_VCPUS}</vcpu>
+          <memory unit='KiB'>{memory_kib}</memory>
+          <currentMemory unit='KiB'>{memory_kib}</currentMemory>
+          <vcpu placement='static'>{vcpus}</vcpu>
           <os>
             <type arch='x86_64' machine='pc-i440fx-rhel7.6.0'>hvm</type>
             <boot dev='hd'/>
@@ -331,34 +341,49 @@ def verify_cluster_identity(vm_ip, expected_id, expected_domain):
 
 def cmd_snapshot(args):
     state = load_state()
-    vm_name = f"test-infra-cluster-{SOURCE_CLUSTER_ID}-master-0"
+    flavor_name = args.name
+    source_id = args.source
+    vm_name = f"test-infra-cluster-{source_id}-master-0"
+    fdir = flavor_dir(flavor_name)
+    crypto = flavor_crypto_dir(flavor_name)
+
+    r = ssh_baremetal(f"virsh dominfo {vm_name}")
+    dominfo = parse_dominfo(r.stdout)
+
+    r = ssh_baremetal(f"virsh dumpxml {vm_name}")
+    disks = parse_disk_paths(r.stdout, f"test-infra-cluster-{source_id}")
+
+    r = ssh_baremetal(f"virsh net-dumpxml test-infra-net-{source_id}")
+    src_primary_subnet = parse_subnet(r.stdout)
+    r = ssh_baremetal(f"virsh net-dumpxml test-infra-secondary-network-{source_id}")
+    src_secondary_subnet = parse_subnet(r.stdout)
 
     r = ssh_baremetal(f"virsh domstate {vm_name}")
     vm_state = r.stdout.strip()
     if vm_state != "running":
         sys.exit(f"Source VM '{vm_name}' is '{vm_state}', expected 'running'")
 
-    print(f"Creating golden snapshot from {vm_name}...")
+    print(f"Creating snapshot flavor '{flavor_name}' from {vm_name}...")
 
     print_step(1, 5, "Extracting crypto keys")
-    vm_ip = f"192.168.{SOURCE_PRIMARY_SUBNET}.{VM_IP_SUFFIX}"
-    source_kc = "/home/test/assisted-test-infra/build/kubeconfig/kubeconfig_test-infra-cluster-6ef80144"
+    vm_ip = f"192.168.{src_primary_subnet}.{VM_IP_SUFFIX}"
+    source_kc = f"/home/test/assisted-test-infra/build/kubeconfig/kubeconfig_test-infra-cluster-{source_id}"
     oc = f"KUBECONFIG={source_kc} oc --insecure-skip-tls-verify --server=https://{vm_ip}:6443"
-    ssh_baremetal(f"mkdir -p {REMOTE_CRYPTO}")
+    ssh_baremetal(f"mkdir -p {crypto}")
     for secret, ns, dest in [
         ("loadbalancer-serving-signer", "openshift-kube-apiserver-operator", "lb-signer.key"),
         ("localhost-serving-signer", "openshift-kube-apiserver-operator", "localhost-signer.key"),
         ("service-network-serving-signer", "openshift-kube-apiserver-operator", "service-network-signer.key"),
         ("router-ca", "openshift-ingress-operator", "ingress.key"),
     ]:
-        ssh_baremetal(f"{oc} extract secret/{secret} -n {ns} --keys=tls.key --to=- > {REMOTE_CRYPTO}/{dest}")
-    ssh_baremetal(f"{oc} extract configmap/admin-kubeconfig-client-ca -n openshift-config --keys=ca-bundle.crt --to=- > {REMOTE_CRYPTO}/admin-kubeconfig-client-ca.crt")
+        ssh_baremetal(f"{oc} extract secret/{secret} -n {ns} --keys=tls.key --to=- > {crypto}/{dest}")
+    ssh_baremetal(f"{oc} extract configmap/admin-kubeconfig-client-ca -n openshift-config --keys=ca-bundle.crt --to=- > {crypto}/admin-kubeconfig-client-ca.crt")
     ingress_cn = ssh_baremetal(
         f"{oc} get secret/router-ca -n openshift-ingress-operator "
         f"-o jsonpath='{{.data.tls\\.crt}}' | base64 -d | openssl x509 -noout -subject | sed 's/subject=CN *= *//'")
     if not ingress_cn.stdout.strip():
         sys.exit("Failed to extract ingress operator CN")
-    ssh_baremetal(f"echo '{ingress_cn.stdout.strip()}' > {REMOTE_CRYPTO}/ingress-cn.txt")
+    ssh_baremetal(f"echo '{ingress_cn.stdout.strip()}' > {crypto}/ingress-cn.txt")
     print_step(1, 5, "Extracting crypto keys", "done")
 
     print_step(2, 5, "Shutting down VM")
@@ -373,32 +398,54 @@ def cmd_snapshot(args):
     print_step(2, 5, "Shutting down VM", "done")
 
     print_step(3, 5, "Creating directories")
-    ssh_baremetal(f"mkdir -p {REMOTE_BASE} {REMOTE_OVERLAYS}")
+    ssh_baremetal(f"mkdir -p {fdir} {REMOTE_OVERLAYS}")
     print_step(3, 5, "Creating directories", "done")
 
-    print_step(4, 5, "Copying disk (~33GB, this takes a few minutes)")
-    ssh_baremetal(f"cp --sparse=always {SOURCE_DISK} {REMOTE_SNAPSHOT}")
-    ssh_baremetal(f"chown qemu:qemu {REMOTE_SNAPSHOT}")
-    print_step(4, 5, "Copying disk (~33GB)", "done")
+    print_step(4, 5, f"Copying {len(disks)} disk(s)")
+    for i, disk in enumerate(disks):
+        dest = f"{fdir}/disk-{i}.qcow2"
+        ssh_baremetal(f"cp --sparse=always {disk['path']} {dest}")
+        ssh_baremetal(f"chown qemu:qemu {dest}")
+    print_step(4, 5, f"Copying {len(disks)} disk(s)", "done")
 
     print_step(5, 5, "Restarting source VM")
     ssh_baremetal(f"virsh start {vm_name}")
     print_step(5, 5, "Restarting source VM", "done")
 
-    state["snapshot"] = {
-        "source_cluster": SOURCE_CLUSTER_ID,
-        "source_disk": SOURCE_DISK,
-        "golden_snapshot": REMOTE_SNAPSHOT,
+    state["flavors"][flavor_name] = {
+        "source_cluster": source_id,
+        "source_primary_subnet": src_primary_subnet,
+        "source_secondary_subnet": src_secondary_subnet,
+        "memory_kib": dominfo["memory_kib"],
+        "vcpus": dominfo["vcpus"],
+        "disks": [f"disk-{i}.qcow2" for i in range(len(disks))],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     save_state(state)
-    print(f"\nSnapshot created at {REMOTE_SNAPSHOT}")
+    print(f"\nFlavor '{flavor_name}' created at {fdir}")
 
 
 def cmd_boot(args):
     state = load_state()
-    if not state.get("snapshot"):
-        sys.exit("No snapshot found. Run 'cluster-tool snapshot' first.")
+    flavors = state.get("flavors", {})
+    if not flavors:
+        sys.exit("No flavors available. Run 'cluster-tool snapshot --name NAME --source ID' first.")
+
+    flavor_name = args.flavor
+    if not flavor_name:
+        flavor_name = max(flavors, key=lambda k: flavors[k].get("created_at", ""))
+    if flavor_name not in flavors:
+        sys.exit(f"Flavor '{flavor_name}' not found. Available: {', '.join(flavors.keys())}")
+
+    flavor = flavors[flavor_name]
+    source_id = flavor["source_cluster"]
+    src_primary = flavor["source_primary_subnet"]
+    src_secondary = flavor["source_secondary_subnet"]
+    memory_kib = flavor["memory_kib"]
+    vcpus = flavor["vcpus"]
+    etcd_image = flavor.get("etcd_image", ETCD_IMAGE)
+    fdir = flavor_dir(flavor_name)
+    crypto = flavor_crypto_dir(flavor_name)
 
     clone_id = args.name or generate_clone_id()
     if clone_id in state.get("clones", {}):
@@ -418,7 +465,7 @@ def cmd_boot(args):
 
     try:
         print_step(1, total, "Creating disk overlay")
-        ssh_baremetal(f"qemu-img create -f qcow2 -b {REMOTE_SNAPSHOT} -F qcow2 {overlay}")
+        ssh_baremetal(f"qemu-img create -f qcow2 -b {fdir}/disk-0.qcow2 -F qcow2 {overlay}")
         ssh_baremetal(f"chown qemu:qemu {overlay}")
         cleanup.append(lambda: ssh_baremetal(f"rm -f {overlay}", check=False))
         print_step(1, total, "Creating disk overlay", "done")
@@ -440,7 +487,7 @@ def cmd_boot(args):
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24", "done")
 
         print_step(3, total, "Booting VM")
-        vm_xml = gen_vm_xml(clone_id, overlay, mac1, mac2)
+        vm_xml = gen_vm_xml(clone_id, overlay, mac1, mac2, memory_kib=memory_kib, vcpus=vcpus)
         write_remote_file(f"/tmp/vm-{clone_id}.xml", vm_xml)
         ssh_baremetal(f"virsh define /tmp/vm-{clone_id}.xml")
         cleanup.append(lambda: ssh_baremetal(f"virsh undefine {vm_name}", check=False))
@@ -459,8 +506,8 @@ def cmd_boot(args):
         print_step(4, total, "Waiting for SSH", "done")
 
         print_step(5, total, "Running recert")
-        src_ip = f"192.168.{SOURCE_PRIMARY_SUBNET}.{VM_IP_SUFFIX}"
-        src_sec_ip = f"192.168.{SOURCE_SECONDARY_SUBNET}.{VM_IP_SUFFIX}"
+        src_ip = f"192.168.{src_primary}.{VM_IP_SUFFIX}"
+        src_sec_ip = f"192.168.{src_secondary}.{VM_IP_SUFFIX}"
         new_sec_ip = f"192.168.{subnet_sec}.{VM_IP_SUFFIX}"
 
         ssh_vm(vm_ip, "sudo systemctl stop kubelet")
@@ -468,14 +515,14 @@ def cmd_boot(args):
         ssh_vm(vm_ip, "sudo systemctl stop crio")
         time.sleep(5)
 
-        ssh_baremetal(f"scp {' '.join(SSH_OPTS)} -r {REMOTE_CRYPTO} core@{vm_ip}:/tmp/crypto")
-        ingress_cn = ssh_baremetal(f"cat {REMOTE_CRYPTO}/ingress-cn.txt").stdout.strip()
+        ssh_baremetal(f"scp {' '.join(SSH_OPTS)} -r {crypto} core@{vm_ip}:/tmp/crypto")
+        ingress_cn = ssh_baremetal(f"cat {crypto}/ingress-cn.txt").stdout.strip()
 
         ssh_vm(vm_ip,
             f"sudo podman run -d --name etcd-recert "
             f"--network host --privileged "
             f"-v /var/lib/etcd:/var/lib/etcd "
-            f"{ETCD_IMAGE} "
+            f"{etcd_image} "
             f"--data-dir /var/lib/etcd "
             f"--listen-client-urls http://localhost:2379 "
             f"--advertise-client-urls http://localhost:2379 "
@@ -516,11 +563,11 @@ def cmd_boot(args):
             f"--cluster-rename test-infra-cluster-{clone_id}:redhat.com "
             f"--hostname {vm_name} "
             f"--ip {vm_ip} "
-            f"--cn-san-replace api.test-infra-cluster-{SOURCE_CLUSTER_ID}.redhat.com:api.{domain} "
-            f"--cn-san-replace api-int.test-infra-cluster-{SOURCE_CLUSTER_ID}.redhat.com:api-int.{domain} "
-            f"--cn-san-replace *.apps.test-infra-cluster-{SOURCE_CLUSTER_ID}.redhat.com:*.apps.{domain} "
-            f"--cn-san-replace test-infra-cluster-{SOURCE_CLUSTER_ID}-master-0:{vm_name} "
-            f"--cn-san-replace system:node:test-infra-cluster-{SOURCE_CLUSTER_ID}-master-0,system:node:{vm_name} "
+            f"--cn-san-replace api.test-infra-cluster-{source_id}.redhat.com:api.{domain} "
+            f"--cn-san-replace api-int.test-infra-cluster-{source_id}.redhat.com:api-int.{domain} "
+            f"--cn-san-replace *.apps.test-infra-cluster-{source_id}.redhat.com:*.apps.{domain} "
+            f"--cn-san-replace test-infra-cluster-{source_id}-master-0:{vm_name} "
+            f"--cn-san-replace system:node:test-infra-cluster-{source_id}-master-0,system:node:{vm_name} "
             f"--cn-san-replace {src_ip}:{vm_ip} "
             f"--cn-san-replace {src_sec_ip}:{new_sec_ip}")
 
@@ -639,6 +686,7 @@ def cmd_boot(args):
         raise
 
     state["clones"][clone_id] = {
+        "flavor": flavor_name,
         "subnet_primary": subnet,
         "subnet_secondary": subnet_sec,
         "vm_name": vm_name,
@@ -758,6 +806,33 @@ def cmd_verify(args):
         sys.exit(1)
 
 
+def cmd_flavors(args):
+    state = load_state()
+    if args.delete:
+        name = args.delete
+        if name in state["flavors"]:
+            ssh_baremetal(f"rm -rf {flavor_dir(name)}", check=False)
+            del state["flavors"][name]
+            save_state(state)
+            print(f'Flavor "{name}" deleted.')
+        else:
+            print(f'Flavor "{name}" not found.')
+        return
+    flavors = state.get("flavors", {})
+    if not flavors:
+        print("No flavors available. Run 'cluster-tool snapshot --name NAME --source CLUSTER_ID' to create one.")
+        return
+    print(f"{'NAME':<20s} {'SOURCE':<12s} {'RAM':<8s} {'CPU':<6s} {'DISKS':<6s} {'CREATED'}")
+    print("-" * 80)
+    for name, info in flavors.items():
+        ram = f"{info.get('memory_kib', 0) // 1024 // 1024}GB"
+        cpus = str(info.get("vcpus", "?"))
+        disks = str(len(info.get("disks", [])))
+        created = info.get("created_at", "?")[:19]
+        source = info.get("source_cluster", "?")
+        print(f"{name:<20s} {source:<12s} {ram:<8s} {cpus:<6s} {disks:<6s} {created}")
+
+
 def cmd_destroy(args):
     state = load_state()
     if args.all:
@@ -796,12 +871,18 @@ def main():
     parser = argparse.ArgumentParser(description="Snapshot-based SNO cluster cloning")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("snapshot", help="Create golden snapshot from running cluster")
+    snap_p = sub.add_parser("snapshot", help="Create a named snapshot flavor from a running cluster")
+    snap_p.add_argument("--name", required=True, help="Flavor name (e.g., sno-64, sno-cnv)")
+    snap_p.add_argument("--source", required=True, help="Source cluster ID (8 hex chars from VM name)")
 
-    boot_p = sub.add_parser("boot", help="Boot a fresh cluster from snapshot")
-    boot_p.add_argument("--name", help="Clone ID (8 hex chars, random if omitted)")
+    boot_p = sub.add_parser("boot", help="Boot a fresh cluster from a snapshot flavor")
+    boot_p.add_argument("--flavor", help="Flavor to boot from (default: most recent)")
+    boot_p.add_argument("--name", help="Clone ID (random if omitted)")
 
     sub.add_parser("list", help="Show running clones")
+
+    flavors_p = sub.add_parser("flavors", help="List or manage snapshot flavors")
+    flavors_p.add_argument("--delete", metavar="NAME", help="Delete a flavor")
 
     verify_p = sub.add_parser("verify", help="Run smoke tests on a clone")
     verify_p.add_argument("name", help="Clone ID to verify")
@@ -811,7 +892,7 @@ def main():
     destroy_p.add_argument("--all", action="store_true", help="Destroy all clones")
 
     args = parser.parse_args()
-    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "verify": cmd_verify, "destroy": cmd_destroy}
+    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy}
 
     if args.command not in cmds:
         parser.print_help()

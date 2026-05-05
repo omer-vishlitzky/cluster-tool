@@ -25,12 +25,12 @@ class TestStateManagement(unittest.TestCase):
 
     def test_load_empty_state(self):
         state = ct.load_state()
-        self.assertIsNone(state["snapshot"])
+        self.assertEqual(state["flavors"], {})
         self.assertEqual(state["clones"], {})
         self.assertEqual(state["next_subnet"], 160)
 
     def test_save_and_load_roundtrip(self):
-        state = {"snapshot": {"source": "abc"}, "clones": {}, "next_subnet": 162}
+        state = {"flavors": {"test": {"source": "abc"}}, "clones": {}, "next_subnet": 162}
         ct.save_state(state)
         loaded = ct.load_state()
         self.assertEqual(loaded, state)
@@ -89,7 +89,7 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("02:00:00:dd:ee:ff", xml)
         self.assertIn("test-infra-net-a1b2c3d4", xml)
         self.assertIn("test-infra-secondary-network-a1b2c3d4", xml)
-        self.assertIn(str(ct.VM_MEMORY_KIB), xml)
+        self.assertIn("67108864", xml)
 
     def test_haproxy_additions(self):
         use_backends, backends = ct.gen_haproxy_additions("a1b2c3d4", 160)
@@ -186,11 +186,16 @@ class TestTransactionalBoot(unittest.TestCase):
         ct.LOCAL_STATE_FILE = Path(os.path.join(self.tmpdir, "state.json"))
         ct.LOCAL_STATE_DIR = Path(self.tmpdir)
         ct.save_state({
-            "snapshot": {
-                "source_cluster": "6ef80144",
-                "source_disk": "/fake/disk",
-                "golden_snapshot": "/root/.cluster-tool/golden-snapshot.qcow2",
-                "created_at": "2026-01-01T00:00:00Z",
+            "flavors": {
+                "default": {
+                    "source_cluster": "6ef80144",
+                    "source_primary_subnet": 135,
+                    "source_secondary_subnet": 153,
+                    "memory_kib": 67108864,
+                    "vcpus": 16,
+                    "disks": ["disk-0.qcow2"],
+                    "created_at": "2026-01-01T00:00:00Z",
+                },
             },
             "clones": {},
             "next_subnet": 160,
@@ -198,7 +203,7 @@ class TestTransactionalBoot(unittest.TestCase):
         self.calls = []
 
     def _boot_args(self):
-        return argparse.Namespace(name="aabbccdd")
+        return argparse.Namespace(name="aabbccdd", flavor="default")
 
     def _make_ssh_mock(self, fail_on):
         def ssh(cmd, check=True):
@@ -595,6 +600,45 @@ Used memory:    67108864 KiB"""
         </network>"""
         subnet = ct.parse_subnet(net_xml)
         self.assertEqual(subnet, 135)
+
+
+class TestFlavorState(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        ct.LOCAL_STATE_FILE = Path(os.path.join(self.tmpdir, "state.json"))
+        ct.LOCAL_STATE_DIR = Path(self.tmpdir)
+
+    def test_load_empty_has_flavors(self):
+        state = ct.load_state()
+        self.assertEqual(state["flavors"], {})
+
+    def test_save_flavor(self):
+        state = ct.load_state()
+        state["flavors"]["sno-64"] = {
+            "source_cluster": "6ef80144",
+            "memory_kib": 67108864,
+            "vcpus": 16,
+            "disks": ["disk-0.qcow2"],
+            "source_primary_subnet": 135,
+            "source_secondary_subnet": 153,
+            "created_at": "2026-05-04T00:00:00Z",
+        }
+        ct.save_state(state)
+        loaded = ct.load_state()
+        self.assertIn("sno-64", loaded["flavors"])
+        self.assertEqual(loaded["flavors"]["sno-64"]["vcpus"], 16)
+
+    def test_backward_compat_old_state(self):
+        old_state = {
+            "snapshot": {"source_cluster": "6ef80144", "golden_snapshot": "/old/path"},
+            "clones": {},
+            "next_subnet": 165,
+        }
+        ct.save_state(old_state)
+        state = ct.load_state()
+        self.assertIn("flavors", state)
+        self.assertIn("default", state["flavors"])
+        self.assertEqual(state["next_subnet"], 165)
 
 
 if __name__ == "__main__":
