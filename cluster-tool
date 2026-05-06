@@ -539,7 +539,14 @@ def cmd_boot(args):
         ssh_baremetal(f"virsh define /tmp/vm-{clone_id}.xml")
         cleanup.append(lambda: ssh_baremetal(f"virsh undefine {vm_name}", check=False))
         ssh_baremetal(f"virsh start {vm_name}")
-        cleanup.append(lambda: ssh_baremetal(f"virsh destroy {vm_name}", check=False))
+        def _destroy_vm():
+            ssh_baremetal(f"virsh destroy {vm_name}", check=False)
+            for _ in range(10):
+                r = ssh_baremetal(f"virsh domstate {vm_name}", check=False)
+                if r.returncode != 0 or "shut off" in r.stdout:
+                    break
+                time.sleep(1)
+        cleanup.append(_destroy_vm)
         ssh_baremetal(f"rm -f /tmp/vm-{clone_id}.xml")
         print_step(3, total, "Booting VM", "done")
 
