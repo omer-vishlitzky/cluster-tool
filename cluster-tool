@@ -900,6 +900,11 @@ def cmd_destroy(args):
         print(f'Destroying clone "{cid}"...')
 
         ssh_baremetal(f"virsh destroy {vm}", check=False)
+        for _ in range(10):
+            r = ssh_baremetal(f"virsh domstate {vm}", check=False)
+            if r.returncode != 0 or "shut off" in r.stdout:
+                break
+            time.sleep(1)
         ssh_baremetal(f"virsh undefine {vm}", check=False)
         ssh_baremetal(f"virsh net-destroy test-infra-net-{cid}", check=False)
         ssh_baremetal(f"virsh net-undefine test-infra-net-{cid}", check=False)
