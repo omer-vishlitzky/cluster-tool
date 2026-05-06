@@ -182,6 +182,7 @@ Each clone gets a fully unique identity through recert:
 - **Preserved CA signing keys** — the 4 kube-apiserver signing keys are preserved via `--use-key` so the kubeconfig's CA chain remains valid (matches the [lifecycle-agent](https://github.com/openshift-kni/lifecycle-agent) production pattern)
 - **Full SAN replacement** — exact-match rules for `api.<domain>`, `api-int.<domain>`, `*.apps.<domain>`, hostname, and `system:node:<hostname>`
 - **DNS configuration** — dnsmasq overrides and nodeip hint set via the official override mechanism (`/etc/default/sno_dnsmasq_configuration_overrides`)
+- **Forked recert image** — we use `quay.io/rh-ee-ovishlit/recert:latest` instead of the upstream `quay.io/edge-infrastructure/recert:latest`. Upstream recert crashes on secrets containing binary (DER-encoded) certificate data (e.g., Keycloak's `key.der`). The fork fixes `process_byte_array_value` in `json_crawl.rs` to skip non-UTF-8 data instead of crashing — matching how the adjacent `process_data_url_value` function already handles binary. Source at `recert-src/`.
 
 ## Prerequisites
 
