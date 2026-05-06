@@ -677,9 +677,6 @@ def cmd_boot(args):
         cleanup.append(("dns", clone_id))
         print_step(7, total, "Configuring access", "done")
 
-        print(f"\n  Kubeconfig available at: {kubeconfig_path}")
-        print(f"  export KUBECONFIG={kubeconfig_path}\n")
-
         print_step(8, total, "Waiting for operators")
         kc_path = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
         oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
