@@ -432,6 +432,25 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "write_remote_file")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_nodeip_configuration_restarted(self, *_):
+        with patch.object(ct, "ssh_baremetal", side_effect=self._make_all_succeed_ssh()):
+            ct.cmd_boot(self._boot_args())
+
+        b64_cmd = next(cmd for cmd, _ in self.calls if "base64 -d | sudo python3" in cmd)
+        import base64 as b64
+        encoded = b64_cmd.split("echo ")[1].split(" | base64")[0]
+        script = b64.b64decode(encoded).decode()
+        self.assertIn("nodeip-configuration", script)
+        self.assertIn("systemctl", script)
+        self.assertIn("restart", script)
+        kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
+        kubeconfig.unlink(missing_ok=True)
+
+    @patch("time.sleep")
+    @patch.object(ct, "write_remote_file")
     @patch.object(ct, "add_dns_entry")
     def test_identity_mismatch_aborts_boot(self, *_):
         mock_co = self._MOCK_CO_JSON
