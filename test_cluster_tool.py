@@ -506,13 +506,15 @@ class TestTransactionalBoot(unittest.TestCase):
         with patch.object(ct, "ssh_baremetal", side_effect=ssh_track_pv):
             ct.cmd_boot(self._boot_args())
 
-        pv_fix_cmd = next(cmd for cmd, _ in self.calls if "base64 -d | sudo python3" in cmd and cmd != next(c for c, _ in self.calls if "base64 -d | sudo python3" in c))
+        b64_cmds = [cmd for cmd, _ in self.calls if "base64 -d | sudo python3" in cmd]
+        pv_fix_cmd = b64_cmds[-1]
         import base64 as b64
         encoded = pv_fix_cmd.split("echo ")[1].split(" | base64")[0]
         script = b64.b64decode(encoded).decode()
         self.assertIn("test-infra-cluster-6ef80144-master-0", script)
         self.assertIn("test-infra-cluster-aabbccdd-master-0", script)
-        self.assertIn("patch", script)
+        self.assertIn("replace", script)
+        self.assertIn("--force", script)
         kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
         kubeconfig.unlink(missing_ok=True)
 

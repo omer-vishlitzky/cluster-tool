@@ -131,11 +131,12 @@ VMs with multiple disks (e.g., LVMS data disks) are fully supported — all non-
 2. **Create networks** — isolated libvirt NAT networks (primary + secondary) with DNS entries for API and apps hostnames.
 3. **Boot VM** — define and start the clone VM with the overlay disk(s), using the flavor's RAM and vCPU specs.
 4. **Wait for SSH** — poll until the VM is reachable.
-5. **Run recert** — stop kubelet/crio, start standalone etcd (using the flavor's detected etcd image), run recert to regenerate all certificates and rename the cluster identity, configure dnsmasq overrides and nodeip hint, restart services.
+5. **Run recert** — stop kubelet/crio, start standalone etcd (using the flavor's detected etcd image), run recert to regenerate all certificates and rename the cluster identity, clear stale nodeip cache, daemon-reload, configure dnsmasq overrides and nodeip hint, restart services.
 6. **Wait for health** — poll `/healthz` until the API server is ready.
 7. **Configure access** — extract kubeconfig, add HAProxy SNI entries, add dnsmasq DNS entry.
 8. **Wait for operators** — poll all ClusterOperators until they are Available and not Degraded.
-9. **Verify identity** — confirm the infrastructure resource has the correct API URL (prevents accidental source cluster corruption).
+9. **Fix PV node affinities** — LVMS/TopoLVM PersistentVolumes have immutable node affinity pinned to the source hostname. Replace each stale PV via `oc replace --force` to match the new hostname. Data on disk is untouched — only the Kubernetes metadata is updated.
+10. **Verify identity** — confirm the infrastructure resource has the correct API URL (prevents accidental source cluster corruption).
 
 If any step fails, all previously created resources are rolled back automatically (transactional boot).
 
