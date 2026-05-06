@@ -37,7 +37,7 @@ SUBNET_START = 160
 SUBNET_SECONDARY_OFFSET = 18
 VM_IP_SUFFIX = 10
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
-RECERT_IMAGE = "quay.io/edge-infrastructure/recert:latest"
+RECERT_IMAGE = "quay.io/rh-ee-ovishlit/recert:latest"
 ETCD_IMAGE = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:96e7c7f2ccac380f0b57c6b3be73c09df05d46b3ff7864acb1ba4fc063d72508"
 DNSMASQ_DIR = Path("/etc/NetworkManager/dnsmasq.d")
 
