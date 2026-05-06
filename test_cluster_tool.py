@@ -185,7 +185,7 @@ class TestDnsEntry(unittest.TestCase):
         conf = Path(self.tmpdir) / "cluster-test01.conf"
         conf.write_text("test")
         ct.remove_dns_entry("test01")
-        mock_run.assert_called_once_with(["nmcli", "general", "reload"], check=False)
+        mock_run.assert_called_once_with(["nmcli", "general", "reload"], check=True)
 
     @patch("subprocess.run")
     def test_remove_dns_entry_missing_file_no_error(self, mock_run):
@@ -216,6 +216,7 @@ class TestTransactionalBoot(unittest.TestCase):
                     "memory_kib": 67108864,
                     "vcpus": 16,
                     "disks": ["disk-0.qcow2"],
+                    "etcd_image": "quay.io/test/etcd:latest",
                     "created_at": "2026-01-01T00:00:00Z",
                 },
             },
@@ -228,19 +229,29 @@ class TestTransactionalBoot(unittest.TestCase):
         return argparse.Namespace(name="aabbccdd", flavor="default")
 
     def _make_ssh_mock(self, fail_on):
+        destroyed = set()
         def ssh(cmd, check=True):
             self.calls.append((cmd, check))
             if fail_on in cmd and check:
                 raise SystemExit(f"Simulated: {fail_on}")
             r = MagicMock()
             r.returncode = 0
-            r.stdout = "fake-ingress-cn" if "ingress-cn" in cmd else ""
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "virsh destroy " in cmd:
+                destroyed.add(cmd.split("virsh destroy ")[1])
+                r.stdout = ""
+            elif "virsh domstate " in cmd:
+                vm = cmd.split("virsh domstate ")[1]
+                r.stdout = "shut off" if vm in destroyed else "running"
+            else:
+                r.stdout = ""
             r.stderr = ""
             return r
         return ssh
 
     def _cleanup_cmds(self):
-        return [cmd for cmd, chk in self.calls if not chk and any(
+        return [cmd for cmd, chk in self.calls if any(
             k in cmd for k in ["rm -f /data/cluster-tool/overlays",
                                 "virsh net-destroy", "virsh net-undefine",
                                 "virsh destroy ", "virsh undefine "]

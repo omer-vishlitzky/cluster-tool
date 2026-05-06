@@ -294,6 +294,17 @@ def write_remote_file(path, content):
     ssh_baremetal(f"echo '{encoded}' | base64 -d > {path}")
 
 
+def destroy_vm(vm_name):
+    r = ssh_baremetal(f"virsh domstate {vm_name}", check=False)
+    if r.returncode != 0:
+        return
+    if "shut off" in r.stdout:
+        ssh_baremetal(f"virsh undefine {vm_name}")
+        return
+    ssh_baremetal(f"virsh destroy {vm_name}")
+    ssh_baremetal(f"virsh undefine {vm_name}")
+
+
 def add_haproxy_clone(clone_id, subnet):
     with locked_haproxy():
         use_backends, backends = gen_haproxy_additions(clone_id, subnet)
@@ -341,7 +352,7 @@ def add_dns_entry(clone_id):
 def remove_dns_entry(clone_id):
     conf = DNSMASQ_DIR / f"cluster-{clone_id}.conf"
     conf.unlink(missing_ok=True)
-    subprocess.run(["nmcli", "general", "reload"], check=False)
+    subprocess.run(["nmcli", "general", "reload"], check=True)
 
 
 def verify_cluster_identity(vm_ip, expected_id, expected_domain):
@@ -349,10 +360,7 @@ def verify_cluster_identity(vm_ip, expected_id, expected_domain):
     r = ssh_vm(vm_ip,
         f"sudo oc --kubeconfig={kc} --insecure-skip-tls-verify "
         f"get infrastructure cluster "
-        f'-o jsonpath="{{.status.apiServerURL}}"',
-        check=False)
-    if r.returncode != 0:
-        sys.exit(f"Failed to verify cluster identity: {r.stderr.strip()}")
+        f'-o jsonpath="{{.status.apiServerURL}}"')
     api_url = r.stdout.strip()
     if expected_domain not in api_url:
         sys.exit(
@@ -367,7 +375,7 @@ def cmd_snapshot(args):
     flavor_name = args.name
     source_id = args.source
 
-    if flavor_name in state.get("flavors", {}):
+    if flavor_name in state["flavors"]:
         sys.exit(f"Flavor '{flavor_name}' already exists. Delete it first with 'cluster-tool flavors --delete {flavor_name}'.")
 
     vm_name = f"test-infra-cluster-{source_id}-master-0"
@@ -469,13 +477,13 @@ def cmd_snapshot(args):
 
 def cmd_boot(args):
     with locked_state() as state:
-        flavors = state.get("flavors", {})
+        flavors = state["flavors"]
         if not flavors:
             sys.exit("No flavors available. Run 'cluster-tool snapshot --name NAME --source ID' first.")
 
         flavor_name = args.flavor
         if not flavor_name:
-            flavor_name = max(flavors, key=lambda k: flavors[k].get("created_at", ""))
+            flavor_name = max(flavors, key=lambda k: flavors[k]["created_at"])
         if flavor_name not in flavors:
             sys.exit(f"Flavor '{flavor_name}' not found. Available: {', '.join(flavors.keys())}")
 
@@ -485,13 +493,13 @@ def cmd_boot(args):
         src_secondary = flavor["source_secondary_subnet"]
         memory_kib = flavor["memory_kib"]
         vcpus = flavor["vcpus"]
-        etcd_image = flavor.get("etcd_image", ETCD_IMAGE)
-        disk_names = flavor.get("disks", ["disk-0.qcow2"])
+        etcd_image = flavor["etcd_image"]
+        disk_names = flavor["disks"]
         fdir = flavor_dir(flavor_name)
         crypto = flavor_crypto_dir(flavor_name)
 
         clone_id = args.name or generate_clone_id()
-        if clone_id in state.get("clones", {}):
+        if clone_id in state["clones"]:
             sys.exit(f"Clone '{clone_id}' already exists.")
 
         subnet = allocate_subnet(state)
@@ -513,7 +521,7 @@ def cmd_boot(args):
             overlay = f"{REMOTE_OVERLAYS}/{clone_id}-{disk_name}"
             ssh_baremetal(f"qemu-img create -f qcow2 -b {fdir}/{disk_name} -F qcow2 {overlay}")
             ssh_baremetal(f"chown qemu:qemu {overlay}")
-            cleanup.append(lambda o=overlay: ssh_baremetal(f"rm -f {o}", check=False))
+            cleanup.append(("rm", overlay))
             overlays.append(overlay)
         print_step(1, total, f"Creating {len(disk_names)} disk overlay(s)", "done")
 
@@ -522,14 +530,12 @@ def cmd_boot(args):
         secondary_xml = gen_secondary_network_xml(clone_id, subnet, subnet_sec, mac2)
         write_remote_file(f"/tmp/net-{clone_id}.xml", primary_xml)
         ssh_baremetal(f"virsh net-define /tmp/net-{clone_id}.xml")
-        cleanup.append(lambda: ssh_baremetal(f"virsh net-undefine test-infra-net-{clone_id}", check=False))
+        cleanup.append(("net", f"test-infra-net-{clone_id}"))
         ssh_baremetal(f"virsh net-start test-infra-net-{clone_id}")
-        cleanup.append(lambda: ssh_baremetal(f"virsh net-destroy test-infra-net-{clone_id}", check=False))
         write_remote_file(f"/tmp/snet-{clone_id}.xml", secondary_xml)
         ssh_baremetal(f"virsh net-define /tmp/snet-{clone_id}.xml")
-        cleanup.append(lambda: ssh_baremetal(f"virsh net-undefine test-infra-secondary-network-{clone_id}", check=False))
+        cleanup.append(("net", f"test-infra-secondary-network-{clone_id}"))
         ssh_baremetal(f"virsh net-start test-infra-secondary-network-{clone_id}")
-        cleanup.append(lambda: ssh_baremetal(f"virsh net-destroy test-infra-secondary-network-{clone_id}", check=False))
         ssh_baremetal(f"rm -f /tmp/net-{clone_id}.xml /tmp/snet-{clone_id}.xml")
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24", "done")
 
@@ -537,16 +543,8 @@ def cmd_boot(args):
         vm_xml = gen_vm_xml(clone_id, overlays, mac1, mac2, memory_kib=memory_kib, vcpus=vcpus)
         write_remote_file(f"/tmp/vm-{clone_id}.xml", vm_xml)
         ssh_baremetal(f"virsh define /tmp/vm-{clone_id}.xml")
-        cleanup.append(lambda: ssh_baremetal(f"virsh undefine {vm_name}", check=False))
         ssh_baremetal(f"virsh start {vm_name}")
-        def _destroy_vm():
-            ssh_baremetal(f"virsh destroy {vm_name}", check=False)
-            for _ in range(10):
-                r = ssh_baremetal(f"virsh domstate {vm_name}", check=False)
-                if r.returncode != 0 or "shut off" in r.stdout:
-                    break
-                time.sleep(1)
-        cleanup.append(_destroy_vm)
+        cleanup.append(("vm", vm_name))
         ssh_baremetal(f"rm -f /tmp/vm-{clone_id}.xml")
         print_step(3, total, "Booting VM", "done")
 
@@ -671,12 +669,12 @@ def cmd_boot(args):
         kc_content = kubeconfig_path.read_text()
         kc_content = kc_content.replace(f"https://{vm_ip}:6443", f"https://api.{domain}:6443")
         kubeconfig_path.write_text(kc_content)
-        cleanup.append(lambda: kubeconfig_path.unlink(missing_ok=True))
+        cleanup.append(("kubeconfig", kubeconfig_path))
 
         add_haproxy_clone(clone_id, subnet)
-        cleanup.append(lambda: remove_haproxy_clone(clone_id))
+        cleanup.append(("haproxy", clone_id))
         add_dns_entry(clone_id)
-        cleanup.append(lambda: remove_dns_entry(clone_id))
+        cleanup.append(("dns", clone_id))
         print_step(7, total, "Configuring access", "done")
 
         print(f"\n  Kubeconfig available at: {kubeconfig_path}")
@@ -691,8 +689,8 @@ def cmd_boot(args):
             if r.returncode == 0:
                 try:
                     nodes = json.loads(r.stdout)
-                    for node in nodes.get("items", []):
-                        for cond in node.get("status", {}).get("conditions", []):
+                    for node in nodes["items"]:
+                        for cond in node["status"]["conditions"]:
                             if cond["type"] == "Ready" and cond["status"] == "True":
                                 node_ready = True
                 except (json.JSONDecodeError, KeyError):
@@ -709,16 +707,16 @@ def cmd_boot(args):
             if r.returncode == 0:
                 try:
                     cos = json.loads(r.stdout)
-                    items = cos.get("items", [])
+                    items = cos["items"]
                     if items:
                         last_unhealthy = []
                         for co in items:
                             name = co["metadata"]["name"]
-                            conds = {c["type"]: c["status"] for c in co.get("status", {}).get("conditions", [])}
+                            conds = {c["type"]: c["status"] for c in co["status"]["conditions"]}
                             if conds.get("Available") != "True" or conds.get("Degraded") == "True":
-                                msg = next((c.get("message", "") for c in co.get("status", {}).get("conditions", []) if c["type"] == "Degraded" and c["status"] == "True"), "")
+                                msg = next((c.get("message", "") for c in co["status"]["conditions"] if c["type"] == "Degraded" and c["status"] == "True"), "")
                                 if not msg:
-                                    msg = next((c.get("message", "") for c in co.get("status", {}).get("conditions", []) if c["type"] == "Available" and c["status"] != "True"), "")
+                                    msg = next((c.get("message", "") for c in co["status"]["conditions"] if c["type"] == "Available" and c["status"] != "True"), "")
                                 last_unhealthy.append(f"{name}: {msg[:120]}")
                         if not last_unhealthy:
                             break
@@ -736,8 +734,20 @@ def cmd_boot(args):
 
     except (SystemExit, subprocess.CalledProcessError) as e:
         print(f"\nBoot failed, rolling back...")
-        for fn in reversed(cleanup):
-            fn()
+        for kind, target in reversed(cleanup):
+            if kind == "vm":
+                destroy_vm(target)
+            elif kind == "net":
+                ssh_baremetal(f"virsh net-destroy {target}")
+                ssh_baremetal(f"virsh net-undefine {target}")
+            elif kind == "rm":
+                ssh_baremetal(f"rm -f {target}")
+            elif kind == "kubeconfig":
+                target.unlink(missing_ok=True)
+            elif kind == "haproxy":
+                remove_haproxy_clone(target)
+            elif kind == "dns":
+                remove_dns_entry(target)
         print("Rollback complete.")
         if isinstance(e, subprocess.CalledProcessError):
             sys.exit(f"Command failed: {e.cmd}\n{e.stderr or e.stdout or ''}")
@@ -764,7 +774,7 @@ def cmd_boot(args):
 
 def cmd_list(args):
     state = load_state()
-    clones = state.get("clones", {})
+    clones = state["clones"]
     if not clones:
         print("No clones running.")
         return
@@ -772,15 +782,13 @@ def cmd_list(args):
     print("-" * 70)
     for cid, info in clones.items():
         subnet = f"192.168.{info['subnet_primary']}.0/24"
-        created = info.get("created_at", "?")[:19]
-        flavor = info.get("flavor", "?")
-        print(f"{cid:<14s} {flavor:<15s} {subnet:<22s} {created}")
+        print(f"{cid:<14s} {info['flavor']:<15s} {subnet:<22s} {info['created_at'][:19]}")
 
 
 def cmd_verify(args):
     state = load_state()
     clone_id = args.name
-    if clone_id not in state.get("clones", {}):
+    if clone_id not in state["clones"]:
         sys.exit(f"Clone '{clone_id}' not found.")
 
     info = state["clones"][clone_id]
@@ -795,15 +803,12 @@ def cmd_verify(args):
     ns = f"smoke-test-{clone_id}"
 
     print_step(1, 4, "Checking operators")
-    r = ssh_vm(vm_ip, f"{oc_vm} get co -o json", check=False)
-    if r.returncode != 0:
-        sys.exit(f"Cannot reach API: {r.stderr.strip()}")
-    import json as _json
-    cos = _json.loads(r.stdout)
+    r = ssh_vm(vm_ip, f"{oc_vm} get co -o json")
+    cos = json.loads(r.stdout)
     unhealthy = []
-    for co in cos.get("items", []):
+    for co in cos["items"]:
         name = co["metadata"]["name"]
-        conds = {c["type"]: c["status"] for c in co.get("status", {}).get("conditions", [])}
+        conds = {c["type"]: c["status"] for c in co["status"]["conditions"]}
         if conds.get("Available") != "True" or conds.get("Degraded") == "True":
             unhealthy.append(name)
     if unhealthy:
@@ -829,22 +834,21 @@ def cmd_verify(args):
     ssh_vm(vm_ip,
         f"{oc_vm} run smoke-test -n {ns} --restart=Never "
         f"--image=registry.access.redhat.com/ubi9/ubi-minimal:latest "
-        f"--command -- sh -c \"{smoke_cmd}\"",
-        check=False)
+        f"--command -- sh -c \"{smoke_cmd}\"")
     print_step(2, 4, "Deploying smoke test pod", "done")
 
     print_step(3, 4, "Waiting for smoke test")
     for _ in range(30):
-        r = ssh_vm(vm_ip, f"{oc_vm} get pod smoke-test -n {ns} -o jsonpath='{{.status.phase}}'", check=False)
+        r = ssh_vm(vm_ip, f"{oc_vm} get pod smoke-test -n {ns} -o jsonpath='{{.status.phase}}'")
         if r.stdout.strip() in ("Succeeded", "Failed"):
             break
         time.sleep(5)
     else:
-        ssh_vm(vm_ip, f"{oc_vm} delete namespace {ns}", check=False)
+        ssh_vm(vm_ip, f"{oc_vm} delete namespace {ns}")
         sys.exit("Smoke test pod did not complete in 2.5 minutes")
 
-    logs = ssh_vm(vm_ip, f"{oc_vm} logs smoke-test -n {ns}", check=False).stdout
-    ssh_vm(vm_ip, f"{oc_vm} delete namespace {ns}", check=False)
+    logs = ssh_vm(vm_ip, f"{oc_vm} logs smoke-test -n {ns}").stdout
+    ssh_vm(vm_ip, f"{oc_vm} delete namespace {ns}")
     print_step(3, 4, "Waiting for smoke test", "done")
 
     print_step(4, 4, "Results")
@@ -869,33 +873,28 @@ def cmd_flavors(args):
     if args.delete:
         name = args.delete
         with locked_state() as state:
-            if name in state["flavors"]:
-                ssh_baremetal(f"rm -rf {flavor_dir(name)}", check=False)
-                del state["flavors"][name]
-                print(f'Flavor "{name}" deleted.')
-            else:
-                print(f'Flavor "{name}" not found.')
+            if name not in state["flavors"]:
+                sys.exit(f'Flavor "{name}" not found.')
+            ssh_baremetal(f"rm -rf {flavor_dir(name)}")
+            del state["flavors"][name]
+            print(f'Flavor "{name}" deleted.')
         return
     state = load_state()
-    flavors = state.get("flavors", {})
+    flavors = state["flavors"]
     if not flavors:
         print("No flavors available. Run 'cluster-tool snapshot --name NAME --source CLUSTER_ID' to create one.")
         return
     print(f"{'NAME':<20s} {'SOURCE':<12s} {'RAM':<8s} {'CPU':<6s} {'DISKS':<6s} {'CREATED'}")
     print("-" * 80)
     for name, info in flavors.items():
-        ram = f"{info.get('memory_kib', 0) // 1024 // 1024}GB"
-        cpus = str(info.get("vcpus", "?"))
-        disks = str(len(info.get("disks", [])))
-        created = info.get("created_at", "?")[:19]
-        source = info.get("source_cluster", "?")
-        print(f"{name:<20s} {source:<12s} {ram:<8s} {cpus:<6s} {disks:<6s} {created}")
+        ram = f"{info['memory_kib'] // 1024 // 1024}GB"
+        print(f"{name:<20s} {info['source_cluster']:<12s} {ram:<8s} {str(info['vcpus']):<6s} {str(len(info['disks'])):<6s} {info['created_at'][:19]}")
 
 
 def cmd_destroy(args):
     state = load_state()
     if args.all:
-        ids = list(state.get("clones", {}).keys())
+        ids = list(state["clones"].keys())
         if not ids:
             print("No clones to destroy.")
             return
@@ -906,23 +905,14 @@ def cmd_destroy(args):
 
     for cid in ids:
         vm = f"test-infra-cluster-{cid}-master-0"
-        clone_info = state.get("clones", {}).get(cid, {})
         print(f'Destroying clone "{cid}"...')
 
-        ssh_baremetal(f"virsh destroy {vm}", check=False)
-        for _ in range(10):
-            r = ssh_baremetal(f"virsh domstate {vm}", check=False)
-            if r.returncode != 0 or "shut off" in r.stdout:
-                break
-            time.sleep(1)
-        ssh_baremetal(f"virsh undefine {vm}", check=False)
+        destroy_vm(vm)
         ssh_baremetal(f"virsh net-destroy test-infra-net-{cid}", check=False)
         ssh_baremetal(f"virsh net-undefine test-infra-net-{cid}", check=False)
         ssh_baremetal(f"virsh net-destroy test-infra-secondary-network-{cid}", check=False)
         ssh_baremetal(f"virsh net-undefine test-infra-secondary-network-{cid}", check=False)
-        for overlay in clone_info.get("overlay_disks", []):
-            ssh_baremetal(f"rm -f {overlay}", check=False)
-        ssh_baremetal(f"rm -f {REMOTE_OVERLAYS}/{cid}-*.qcow2", check=False)
+        ssh_baremetal(f"rm -f {REMOTE_OVERLAYS}/{cid}-*.qcow2")
 
         remove_haproxy_clone(cid)
         remove_dns_entry(cid)
