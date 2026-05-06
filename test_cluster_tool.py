@@ -337,9 +337,12 @@ class TestTransactionalBoot(unittest.TestCase):
         ]}}
     ]})
 
+    _MOCK_PV_JSON = json.dumps({"items": []})
+
     def _make_all_succeed_ssh(self):
         mock_co = self._MOCK_CO_JSON
         mock_nodes = self._MOCK_NODES_JSON
+        mock_pvs = self._MOCK_PV_JSON
         def ssh(cmd, check=True):
             self.calls.append((cmd, check))
             r = MagicMock()
@@ -352,6 +355,8 @@ class TestTransactionalBoot(unittest.TestCase):
                 r.stdout = mock_co
             elif "get nodes -o json" in cmd:
                 r.stdout = mock_nodes
+            elif "get pv -o json" in cmd:
+                r.stdout = mock_pvs
             else:
                 r.stdout = "ok"
             r.stderr = ""
@@ -463,6 +468,51 @@ class TestTransactionalBoot(unittest.TestCase):
         daemon_idx = next(i for i, l in enumerate(lines) if "daemon-reload" in l)
         self.assertLess(rmtree_idx, restart_idx)
         self.assertLess(restart_idx, daemon_idx)
+        kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
+        kubeconfig.unlink(missing_ok=True)
+
+    @patch("time.sleep")
+    @patch.object(ct, "write_remote_file")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_pv_node_affinity_patched(self, *_):
+        mock_pvs = json.dumps({"items": [
+            {"metadata": {"name": "pvc-abc123"}, "spec": {"nodeAffinity": {"required": {"nodeSelectorTerms": [
+                {"matchExpressions": [{"key": "topology.topolvm.io/node", "operator": "In", "values": ["test-infra-cluster-6ef80144-master-0"]}]}
+            ]}}}}
+        ]})
+        mock_co = self._MOCK_CO_JSON
+        mock_nodes = self._MOCK_NODES_JSON
+        def ssh_track_pv(cmd, check=True):
+            self.calls.append((cmd, check))
+            r = MagicMock()
+            r.returncode = 0
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "infrastructure cluster" in cmd:
+                r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
+            elif "get pv -o json" in cmd:
+                r.stdout = mock_pvs
+            else:
+                r.stdout = "ok"
+            r.stderr = ""
+            return r
+
+        with patch.object(ct, "ssh_baremetal", side_effect=ssh_track_pv):
+            ct.cmd_boot(self._boot_args())
+
+        pv_fix_cmd = next(cmd for cmd, _ in self.calls if "base64 -d | sudo python3" in cmd and cmd != next(c for c, _ in self.calls if "base64 -d | sudo python3" in c))
+        import base64 as b64
+        encoded = pv_fix_cmd.split("echo ")[1].split(" | base64")[0]
+        script = b64.b64decode(encoded).decode()
+        self.assertIn("test-infra-cluster-6ef80144-master-0", script)
+        self.assertIn("test-infra-cluster-aabbccdd-master-0", script)
+        self.assertIn("patch", script)
         kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
         kubeconfig.unlink(missing_ok=True)
 

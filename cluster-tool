@@ -510,7 +510,7 @@ def cmd_boot(args):
     vm_name = f"test-infra-cluster-{clone_id}-master-0"
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
 
-    total = 9
+    total = 10
     print(f'Creating clone "{clone_id}"...')
     cleanup = []
 
@@ -728,9 +728,34 @@ def cmd_boot(args):
             sys.exit(f"Operators not healthy after 20 minutes.\nUnhealthy operators:\n{detail}")
         print_step(8, total, "Waiting for operators", f"done ({len(items)}/{len(items)})")
 
-        print_step(9, total, "Verifying cluster identity")
+        print_step(9, total, "Fixing PV node affinities")
+        src_hostname = f"test-infra-cluster-{source_id}-master-0"
+        pv_fix = (
+            f"import json, subprocess\n"
+            f"r = subprocess.run(['oc', '--kubeconfig={kc_path}', '--insecure-skip-tls-verify', 'get', 'pv', '-o', 'json'], capture_output=True, text=True)\n"
+            f"pvs = json.loads(r.stdout)\n"
+            f"patched = 0\n"
+            f"for pv in pvs['items']:\n"
+            f"    aff = pv.get('spec', {{}}).get('nodeAffinity', {{}})\n"
+            f"    terms = aff.get('required', {{}}).get('nodeSelectorTerms', [])\n"
+            f"    needs_patch = False\n"
+            f"    for term in terms:\n"
+            f"        for expr in term.get('matchExpressions', []):\n"
+            f"            if '{src_hostname}' in expr.get('values', []):\n"
+            f"                expr['values'] = ['{vm_name}']\n"
+            f"                needs_patch = True\n"
+            f"    if needs_patch:\n"
+            f"        patch = json.dumps({{'spec': {{'nodeAffinity': aff}}}})\n"
+            f"        subprocess.run(['oc', '--kubeconfig={kc_path}', '--insecure-skip-tls-verify', 'patch', 'pv', pv['metadata']['name'], '--type=merge', '-p', patch], check=True)\n"
+            f"        patched += 1\n"
+        )
+        pv_fix_b64 = base64.b64encode(pv_fix.encode()).decode()
+        r = ssh_vm(vm_ip, f"echo {pv_fix_b64} | base64 -d | sudo python3")
+        print_step(9, total, "Fixing PV node affinities", "done")
+
+        print_step(10, total, "Verifying cluster identity")
         verify_cluster_identity(vm_ip, clone_id, domain)
-        print_step(9, total, "Verifying cluster identity", "done")
+        print_step(10, total, "Verifying cluster identity", "done")
 
     except (SystemExit, subprocess.CalledProcessError) as e:
         print(f"\nBoot failed, rolling back...")
