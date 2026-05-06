@@ -630,7 +630,10 @@ def cmd_boot(args):
             f"'KUBELET_NODEIP_HINT=192.168.{subnet}.0\\n')\n"
             f"import subprocess\n"
             f"subprocess.run(['hostnamectl', 'set-hostname', '{vm_name}'], check=True)\n"
+            f"import shutil\n"
+            f"shutil.rmtree('/run/nodeip-configuration', ignore_errors=True)\n"
             f"subprocess.run(['systemctl', 'restart', 'nodeip-configuration'], check=True)\n"
+            f"subprocess.run(['systemctl', 'daemon-reload'], check=True)\n"
             f"subprocess.run(['systemctl', 'restart', 'NetworkManager'], check=True)\n"
             f"subprocess.run(['systemctl', 'restart', 'dnsmasq'], check=True)\n"
         )

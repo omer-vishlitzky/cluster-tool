@@ -435,7 +435,7 @@ class TestTransactionalBoot(unittest.TestCase):
     @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
     @patch.object(ct, "add_dns_entry")
-    def test_nodeip_configuration_restarted(self, *_):
+    def test_node_fix_clears_stale_nodeip_cache(self, *_):
         with patch.object(ct, "ssh_baremetal", side_effect=self._make_all_succeed_ssh()):
             ct.cmd_boot(self._boot_args())
 
@@ -443,9 +443,15 @@ class TestTransactionalBoot(unittest.TestCase):
         import base64 as b64
         encoded = b64_cmd.split("echo ")[1].split(" | base64")[0]
         script = b64.b64decode(encoded).decode()
-        self.assertIn("nodeip-configuration", script)
-        self.assertIn("systemctl", script)
-        self.assertIn("restart", script)
+        self.assertIn("rmtree('/run/nodeip-configuration'", script)
+        self.assertIn("restart', 'nodeip-configuration'", script)
+        self.assertIn("daemon-reload", script)
+        lines = script.strip().split("\n")
+        rmtree_idx = next(i for i, l in enumerate(lines) if "rmtree" in l)
+        restart_idx = next(i for i, l in enumerate(lines) if "nodeip-configuration" in l and "restart" in l)
+        daemon_idx = next(i for i, l in enumerate(lines) if "daemon-reload" in l)
+        self.assertLess(rmtree_idx, restart_idx)
+        self.assertLess(restart_idx, daemon_idx)
         kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
         kubeconfig.unlink(missing_ok=True)
 
