@@ -128,10 +128,10 @@ VMs with multiple disks (e.g., LVMS data disks) are fully supported — all non-
 ## What Happens During Boot
 
 1. **Create disk overlay(s)** — qcow2 copy-on-write backed by the golden snapshot(s). Instant, no multi-GB copy.
-2. **Create networks** — isolated libvirt NAT networks (primary + secondary) with DNS entries for API and apps hostnames.
+2. **Create networks** — isolated libvirt NAT networks (primary + secondary) with DNS entries for API and apps hostnames. Each network gets an explicit bridge name (`br-<id>` / `bs-<id>`, truncated to the 15-char Linux limit).
 3. **Boot VM** — define and start the clone VM with the overlay disk(s), using the flavor's RAM and vCPU specs.
 4. **Wait for SSH** — poll until the VM is reachable.
-5. **Run recert** — stop kubelet/crio, start standalone etcd (using the flavor's detected etcd image), run recert to regenerate all certificates and rename the cluster identity, clear stale nodeip cache, daemon-reload, configure dnsmasq overrides and nodeip hint, restart services.
+5. **Run recert** — stop kubelet/crio, start standalone etcd (using the flavor's detected etcd image), run recert to regenerate all certificates, rename the cluster identity, fix PV node affinities, clear stale nodeip cache, daemon-reload, configure dnsmasq overrides and nodeip hint, restart services.
 6. **Wait for health** — poll `/healthz` until the API server is ready.
 7. **Configure access** — extract kubeconfig, add HAProxy SNI entries, add dnsmasq DNS entry.
 8. **Wait for operators** — poll all ClusterOperators until they are Available and not Degraded.
@@ -141,12 +141,14 @@ If any step fails, all previously created resources are rolled back automaticall
 
 ## What Happens During Snapshot
 
-1. **Detect VM specs** — parse `virsh dominfo` and `virsh dumpxml` to get RAM, vCPUs, disk paths, and subnets.
-2. **Detect etcd image** — read the etcd pod manifest from the running cluster.
-3. **Extract crypto keys** — the 4 CA signing keys (lb-signer, localhost-signer, service-network-signer, ingress) and the admin kubeconfig CA.
-4. **Shut down VM** — graceful shutdown, wait for "shut off".
+1. **Detect etcd image** — read the etcd pod manifest from the running cluster.
+2. **Extract crypto keys** — the 4 CA signing keys (lb-signer, localhost-signer, service-network-signer, ingress) and the admin kubeconfig CA.
+3. **Shut down VM** — graceful shutdown, wait for "shut off".
+4. **Create directories** — set up the flavor directory on the baremetal host.
 5. **Copy disk(s)** — sparse copy of all detected disks to the flavor directory.
 6. **Restart VM** — bring the source cluster back up.
+
+VM specs (RAM, vCPUs, disk paths, subnets) are auto-detected from `virsh dominfo` and `virsh dumpxml` before the snapshot begins.
 
 ## Architecture
 
@@ -171,6 +173,30 @@ Your laptop                          Baremetal host
 - HAProxy on the baremetal host routes API and ingress traffic to clones via SNI.
 - State is tracked locally at `~/.cluster-tool/state.json`.
 
+## Parallel Usage
+
+Multiple `boot` and `destroy` operations can run concurrently. File locking (`fcntl`) protects shared resources:
+
+- **State lock** (`~/.cluster-tool/state.lock`) — serializes subnet allocation and clone registration.
+- **HAProxy lock** (`~/.cluster-tool/haproxy.lock`) — serializes reads and writes to `/etc/haproxy/haproxy.cfg`.
+
+Each clone gets its own bridge name derived from its clone ID (`br-<id[:8]>` and `bs-<id[:8]>`), so parallel network creation never collides. Bridge names are truncated to 15 characters to stay within the Linux interface name limit.
+
+HAProxy entries are inserted idempotently — existing entries for a clone ID are stripped before new ones are added, so a retry after a partial failure won't create duplicates.
+
+Clone IDs that are substrings of each other (e.g., `demo` and `dev-env-demo`) are handled correctly — HAProxy backend names include the full clone ID, so stripping one clone's entries never touches another's.
+
+## Clone-of-Clone Support
+
+Snapshots work on clones too, not just original installations. You can snapshot a running clone to create a new flavor, then boot further clones from it.
+
+When booting from a clone-of-clone snapshot, the tool:
+- Clears the stale `/run/nodeip-configuration` cache (left over from the previous clone's identity)
+- Runs `systemctl daemon-reload` before restarting kubelet (picks up unit file changes from recert)
+- Restarts `nodeip-configuration` to bind to the new subnet
+
+Without these steps, kubelet would start with the previous clone's IP address and the node would never become Ready.
+
 ## Recert Integration
 
 Each clone gets a fully unique identity through recert:
@@ -181,8 +207,32 @@ Each clone gets a fully unique identity through recert:
 - **New hostname** — node name matches clone ID (via `--hostname`, `--cn-san-replace`)
 - **Preserved CA signing keys** — the 4 kube-apiserver signing keys are preserved via `--use-key` so the kubeconfig's CA chain remains valid (matches the [lifecycle-agent](https://github.com/openshift-kni/lifecycle-agent) production pattern)
 - **Full SAN replacement** — exact-match rules for `api.<domain>`, `api-int.<domain>`, `*.apps.<domain>`, hostname, and `system:node:<hostname>`
+- **PV node affinity fix** — PersistentVolumes with node affinity (e.g., LVMS/TopoLVM) have their hostname values replaced in etcd during recert, so LVMS volumes bind to the new node without API-level workarounds
 - **DNS configuration** — dnsmasq overrides and nodeip hint set via the official override mechanism (`/etc/default/sno_dnsmasq_configuration_overrides`)
-- **Forked recert image** — we use `quay.io/rh-ee-ovishlit/recert:latest` instead of the upstream `quay.io/edge-infrastructure/recert:latest`. Upstream recert crashes on secrets containing binary (DER-encoded) certificate data (e.g., Keycloak's `key.der`). The fork fixes `process_byte_array_value` in `json_crawl.rs` to skip non-UTF-8 data instead of crashing — matching how the adjacent `process_data_url_value` function already handles binary. Source at `recert-src/`.
+
+### Forked Recert Image
+
+We use `quay.io/rh-ee-ovishlit/recert:latest` instead of the upstream `quay.io/edge-infrastructure/recert:latest`. The fork contains two fixes:
+
+**Fix 1: Binary DER data handling.** Upstream recert crashes on secrets containing binary (DER-encoded) certificate data (e.g., Keycloak's `key.der`). The `process_byte_array_value` function in `json_crawl.rs` called `String::from_utf8(bytes)` with `.context()`, which turns non-UTF-8 data into a hard error. The fork changes this to return `None` for non-UTF-8 data — matching how the adjacent `process_data_url_value` function already handles binary content.
+
+**Fix 2: PersistentVolume node affinity hostname replacement.** Upstream recert doesn't know about PersistentVolume resources in etcd. When `--hostname` is used, PVs with node affinity (created by LVMS/TopoLVM) still reference the old hostname, causing volumes to be unschedulable on the renamed node. The fork adds:
+- PersistentVolume decoding/encoding support in `etcd_encoding.rs`
+- A `fix_persistent_volumes` function in `hostname_rename/etcd_rename.rs` that walks all PVs and replaces old hostname values in `spec.nodeAffinity.required.nodeSelectorTerms[].matchExpressions[].values[]`
+
+Source at `../recert-src/`.
+
+## OSAC Integration
+
+When using cluster-tool to boot clusters for [OSAC](https://github.com/openshift-assisted/osac-installer) development, the cloned cluster needs its operator subscriptions and routes refreshed. The `refresh-after-snapshot.sh` script (in the osac-installer repo, [PR #95](https://github.com/openshift-assisted/osac-installer/pull/95)) handles this:
+
+```bash
+# After booting a clone for OSAC development
+export KUBECONFIG=~/.kube/my-test.kubeconfig
+./refresh-after-snapshot.sh
+```
+
+The script deletes and recreates operator subscriptions (Authorino, AAP, Hive, MCE) so they re-resolve in the new cluster identity, and patches any routes that still reference the source cluster's domain.
 
 ## Prerequisites
 
@@ -207,13 +257,20 @@ After this, `cluster-tool boot` handles DNS automatically — no manual `/etc/ho
 
 ## Reliability
 
-- **Transactional boot** — if any step fails, all created resources (overlay, networks, VM, HAProxy entries) are rolled back automatically.
+- **Transactional boot** — if any step fails, all created resources (overlay, networks, VM, HAProxy entries) are rolled back automatically. The VM is waited on until fully dead before removing overlays.
 - **State saved only on success** — no orphaned entries from failed boots.
 - **Identity verification** — after recert, the tool confirms the clone's `apiServerURL` matches the expected domain before configuring external access.
 - **Idempotent destroy** — works by clone ID alone, doesn't need state. Handles orphaned resources from crashed boots.
+- **Idempotent HAProxy** — existing entries for a clone ID are stripped before insertion, so retries and re-boots never create duplicates.
 - **Operator health gate** — boot waits for ALL ClusterOperators to be Available and not Degraded before declaring the cluster ready.
+- **File locking** — concurrent boot/destroy operations are safe via `fcntl` locks on state and HAProxy.
+- **Fail-fast** — no silent error suppression. SSH failures, subprocess errors, and unexpected states abort immediately with a clear message.
 
 ## Roadmap
+
+### OSAC Internal Service URLs
+
+OSAC components currently use external routes (e.g., `https://assisted-service.apps.<domain>:443`) to communicate with each other. These routes go through HAProxy and ingress, adding latency and a dependency on DNS/TLS for intra-cluster traffic. The correct pattern is to use internal service URLs (e.g., `http://assisted-service.assisted-installer.svc.cluster.local:8090`), which stay within the cluster network. This is a design improvement in osac-installer, not in cluster-tool, but it would eliminate the need for route patching after snapshot-based boots.
 
 ### Distributable Artifacts via OCI Registry
 
@@ -237,17 +294,19 @@ The vision: a new user clones this repo, runs `./cluster-tool boot --flavor sno-
 A Claude Code skill that lets any AI agent spawn clusters on demand:
 
 ```
-/cluster boot --flavor sno-64 --name agent-test
+/spawn-cluster boot --flavor sno-64 --name agent-test
 ```
+
+The skill is prototyped at `~/.claude/skills/spawn-cluster/` and handles boot, list, verify, and destroy. Once cluster-tool is on PATH (symlinked to `~/.local/bin/cluster-tool`), the skill provides natural language access to cluster lifecycle.
 
 ## Testing
 
 ```bash
-# Run unit tests
+# Run unit tests (48 tests)
 python3 test_cluster_tool.py -v
 
 # Run smoke tests on a live clone
 ./cluster-tool verify <clone-id>
 ```
 
-Tests cover: state management, template generation, multi-disk VM XML, transactional rollback at every failure point, reverse cleanup order, CalledProcessError handling, recert flag verification, identity mismatch detection, and the success path.
+Tests cover: state management, template generation, multi-disk VM XML, transactional rollback at every failure point, reverse cleanup order, CalledProcessError handling, recert flag verification, identity mismatch detection, file locking, bridge name truncation, flavor state operations, dnsmasq config generation, and the success path.
