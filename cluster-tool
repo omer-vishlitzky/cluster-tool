@@ -306,15 +306,21 @@ def destroy_vm(vm_name):
 
 
 def _strip_haproxy_clone(config, clone_id):
+    backend_names = {f"api-{clone_id}", f"ingress-https-{clone_id}", f"ingress-http-{clone_id}"}
     lines = config.split("\n")
     filtered = []
     skip_block = False
     for line in lines:
-        if "use_backend" in line and f"-{clone_id}" in line:
-            continue
-        if line.strip().startswith("backend") and f"-{clone_id}" in line:
-            skip_block = True
-            continue
+        if "use_backend" in line:
+            parts = line.split()
+            idx = parts.index("use_backend") if "use_backend" in parts else -1
+            if idx >= 0 and idx + 1 < len(parts) and parts[idx + 1] in backend_names:
+                continue
+        if line.strip().startswith("backend "):
+            name = line.strip().split()[1]
+            if name in backend_names:
+                skip_block = True
+                continue
         if skip_block:
             if line.strip() and not line.strip().startswith("backend") and not line.strip().startswith("frontend"):
                 continue
@@ -732,7 +738,7 @@ def cmd_boot(args):
 
         print_step(9, total, "Verifying cluster identity")
         verify_cluster_identity(vm_ip, clone_id, domain)
-        print_step(10, total, "Verifying cluster identity", "done")
+        print_step(9, total, "Verifying cluster identity", "done")
 
     except (SystemExit, subprocess.CalledProcessError) as e:
         print(f"\nBoot failed, rolling back...")

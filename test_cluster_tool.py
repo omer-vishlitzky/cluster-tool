@@ -122,6 +122,20 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("192.168.160.10:443", backends)
         self.assertIn("192.168.160.10:80", backends)
 
+    def test_haproxy_strip_no_substring_collision(self):
+        use_a, back_a = ct.gen_haproxy_additions("demo", 160)
+        use_b, back_b = ct.gen_haproxy_additions("dev-env-demo", 161)
+        config = "frontend api\n    default_backend api-source\n\nfrontend ingress-https\n    default_backend ingress-https-source\n\nfrontend ingress-http\n    default_backend ingress-http-source\n"
+        for key in ["api", "ingress-https", "ingress-http"]:
+            marker = f"    default_backend {key}-"
+            config = config.replace(marker, f"{use_a[key]}\n{use_b[key]}\n\n{marker}", 1)
+        config += back_a + back_b
+        stripped = ct._strip_haproxy_clone(config, "demo")
+        self.assertNotIn("api-demo ", stripped)
+        self.assertNotIn("backend api-demo\n", stripped)
+        self.assertIn("api-dev-env-demo", stripped)
+        self.assertIn("backend api-dev-env-demo", stripped)
+
     def test_dnsmasq_conf(self):
         conf = ct.gen_dnsmasq_conf("a1b2c3d4")
         self.assertEqual(conf, "address=/test-infra-cluster-a1b2c3d4.redhat.com/10.1.155.16\n")
