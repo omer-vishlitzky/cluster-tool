@@ -305,11 +305,31 @@ def destroy_vm(vm_name):
     ssh_baremetal(f"virsh undefine {vm_name}")
 
 
+def _strip_haproxy_clone(config, clone_id):
+    lines = config.split("\n")
+    filtered = []
+    skip_block = False
+    for line in lines:
+        if "use_backend" in line and f"-{clone_id}" in line:
+            continue
+        if line.strip().startswith("backend") and f"-{clone_id}" in line:
+            skip_block = True
+            continue
+        if skip_block:
+            if line.strip() and not line.strip().startswith("backend") and not line.strip().startswith("frontend"):
+                continue
+            skip_block = False
+            if not line.strip():
+                continue
+        filtered.append(line)
+    return "\n".join(filtered)
+
+
 def add_haproxy_clone(clone_id, subnet):
     with locked_haproxy():
         use_backends, backends = gen_haproxy_additions(clone_id, subnet)
         result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
-        config = result.stdout
+        config = _strip_haproxy_clone(result.stdout, clone_id)
 
         for key in ["api", "ingress-https", "ingress-http"]:
             marker = f"    default_backend {key}-"
@@ -323,23 +343,8 @@ def add_haproxy_clone(clone_id, subnet):
 def remove_haproxy_clone(clone_id):
     with locked_haproxy():
         result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
-        lines = result.stdout.split("\n")
-        filtered = []
-        skip_block = False
-        for line in lines:
-            if f"use_backend" in line and f"-{clone_id}" in line:
-                continue
-            if line.strip().startswith("backend") and f"-{clone_id}" in line:
-                skip_block = True
-                continue
-            if skip_block:
-                if line.strip() and not line.strip().startswith("backend") and not line.strip().startswith("frontend"):
-                    continue
-                skip_block = False
-                if not line.strip():
-                    continue
-            filtered.append(line)
-        write_remote_file("/etc/haproxy/haproxy.cfg", "\n".join(filtered))
+        config = _strip_haproxy_clone(result.stdout, clone_id)
+        write_remote_file("/etc/haproxy/haproxy.cfg", config)
         ssh_baremetal("systemctl reload haproxy")
 
 
@@ -941,7 +946,7 @@ def cmd_destroy(args):
         ssh_baremetal(f"virsh net-undefine test-infra-net-{cid}", check=False)
         ssh_baremetal(f"virsh net-destroy test-infra-secondary-network-{cid}", check=False)
         ssh_baremetal(f"virsh net-undefine test-infra-secondary-network-{cid}", check=False)
-        ssh_baremetal(f"rm -f {REMOTE_OVERLAYS}/{cid}-*.qcow2")
+        ssh_baremetal(f"bash -c 'rm -f {REMOTE_OVERLAYS}/{cid}-*.qcow2'")
 
         remove_haproxy_clone(cid)
         remove_dns_entry(cid)
