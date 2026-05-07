@@ -135,8 +135,7 @@ VMs with multiple disks (e.g., LVMS data disks) are fully supported — all non-
 6. **Wait for health** — poll `/healthz` until the API server is ready.
 7. **Configure access** — extract kubeconfig, add HAProxy SNI entries, add dnsmasq DNS entry.
 8. **Wait for operators** — poll all ClusterOperators until they are Available and not Degraded.
-9. **Fix PV node affinities** — LVMS/TopoLVM PersistentVolumes have immutable node affinity pinned to the source hostname. Replace each stale PV via `oc replace --force` to match the new hostname. Data on disk is untouched — only the Kubernetes metadata is updated.
-10. **Verify identity** — confirm the infrastructure resource has the correct API URL (prevents accidental source cluster corruption).
+9. **Verify identity** — confirm the infrastructure resource has the correct API URL (prevents accidental source cluster corruption).
 
 If any step fails, all previously created resources are rolled back automatically (transactional boot).
 
