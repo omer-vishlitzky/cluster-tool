@@ -843,23 +843,41 @@ def cmd_boot(args):
         kc_path = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
         oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
         node_ready = False
-        for _ in range(60):
+        for attempt in range(360):
             r = env.run_vm(vm_ip, f"{oc_vm} get nodes -o json", check=False, identity=key_path)
             if r.returncode == 0:
                 try:
                     nodes = json.loads(r.stdout)
                     for node in nodes["items"]:
-                        for cond in node["status"]["conditions"]:
-                            if cond["type"] == "Ready" and cond["status"] == "True":
-                                node_ready = True
+                        conds = {c["type"]: c for c in node["status"]["conditions"]}
+                        ready_cond = conds.get("Ready", {})
+                        if ready_cond.get("status") == "True":
+                            node_ready = True
+                        elif attempt % 6 == 0:
+                            reason = ready_cond.get("reason", "unknown")
+                            message = ready_cond.get("message", "")[:200]
+                            net_cond = conds.get("NetworkUnavailable", {})
+                            net_msg = f", NetworkUnavailable={net_cond.get('status', '?')}" if net_cond else ""
+                            print(f"\n    [{attempt*5}s] Node NotReady: reason={reason}{net_msg}")
+                            if message:
+                                print(f"           {message}")
+                            diag = env.run_vm(vm_ip, "sudo crictl pods --state ready -q 2>/dev/null | wc -l", check=False, identity=key_path)
+                            diag2 = env.run_vm(vm_ip, "sudo crictl pods -q 2>/dev/null | wc -l", check=False, identity=key_path)
+                            print(f"           Pods: {diag.stdout.strip()} ready / {diag2.stdout.strip()} total")
+                            ovn = env.run_vm(vm_ip, "sudo crictl pods --name ovnkube -o json 2>/dev/null | python3 -c \"import sys,json; pods=json.loads(sys.stdin.read()).get('items',[]); print('; '.join(f'{p[\\\"metadata\\\"][\\\"name\\\"]}={p[\\\"state\\\"]}' for p in pods))\" 2>/dev/null || echo 'cannot query'", check=False, identity=key_path)
+                            print(f"           OVN-K: {ovn.stdout.strip()}")
                 except (json.JSONDecodeError, KeyError):
-                    pass
+                    if attempt % 6 == 0:
+                        print(f"\n    [{attempt*5}s] Cannot parse node status")
+            else:
+                if attempt % 6 == 0:
+                    print(f"\n    [{attempt*5}s] oc get nodes failed (rc={r.returncode})")
             if node_ready:
                 break
             time.sleep(5)
         else:
             r = env.run_vm(vm_ip, f"{oc_vm} get nodes -o wide", check=False, identity=key_path)
-            sys.exit(f"Node not Ready after 5 minutes.\n{r.stdout}\n{r.stderr}")
+            sys.exit(f"Node not Ready after 30 minutes.\n{r.stdout}\n{r.stderr}")
         last_unhealthy = []
         for attempt in range(120):
             r = env.run_vm(vm_ip, f"{oc_vm} get co -o json", check=False, identity=key_path)
@@ -1313,6 +1331,7 @@ def _setup_server(*, data_path=None):
     env.run("systemctl restart haproxy")
 
     print("[3/6] Generating SSH keypair...")
+    env.run("mkdir -p ~/.config/cluster-tool")
     env.run("test -f ~/.config/cluster-tool/cluster-tool.key || "
             "ssh-keygen -t ed25519 -f ~/.config/cluster-tool/cluster-tool.key -N '' -q")
 
