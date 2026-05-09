@@ -12,13 +12,28 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+import socket
 import xml.etree.ElementTree as ET
 
-BAREMETAL_HOST = "root@rdu-infra-edge-07.infra-edge.lab.eng.rdu2.redhat.com"
-BAREMETAL_IP = "10.1.155.16"
-REMOTE_BASE = "/data/cluster-tool"
-REMOTE_OVERLAYS = f"{REMOTE_BASE}/overlays"
-REMOTE_FLAVORS = f"{REMOTE_BASE}/flavors"
+REMOTE_BASE = None
+REMOTE_OVERLAYS = None
+REMOTE_FLAVORS = None
+PODMAN_ROOT = None
+
+
+def _init_paths(data_dir):
+    global REMOTE_BASE, REMOTE_OVERLAYS, REMOTE_FLAVORS, PODMAN_ROOT
+    REMOTE_BASE = data_dir
+    REMOTE_OVERLAYS = f"{REMOTE_BASE}/overlays"
+    REMOTE_FLAVORS = f"{REMOTE_BASE}/flavors"
+    PODMAN_ROOT = f"{REMOTE_BASE}/containers/storage"
+
+
+def podman(subcmd):
+    return (f"mkdir -p {REMOTE_BASE}/tmp && "
+            f"TMPDIR={REMOTE_BASE}/tmp "
+            f"CONTAINERS_CONF=${{HOME}}/.config/containers/containers.conf "
+            f"podman --root {PODMAN_ROOT} {subcmd}")
 
 
 def flavor_dir(name):
@@ -30,33 +45,130 @@ def flavor_crypto_dir(name):
 
 
 _REAL_HOME = Path(os.path.expanduser(f"~{os.environ.get('SUDO_USER', '')}"))
-LOCAL_STATE_DIR = _REAL_HOME / ".cluster-tool"
-LOCAL_STATE_FILE = LOCAL_STATE_DIR / "state.json"
 KUBECONFIG_DIR = _REAL_HOME / ".kube"
+CLIENT_CONFIG_DIR = _REAL_HOME / ".config" / "cluster-tool"
+CLIENT_SERVERS_FILE = CLIENT_CONFIG_DIR / "servers.json"
+
+
+def load_servers():
+    if CLIENT_SERVERS_FILE.exists():
+        return json.loads(CLIENT_SERVERS_FILE.read_text())
+    return {"servers": {}, "default": None}
+
+
+def save_servers(config):
+    CLIENT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CLIENT_SERVERS_FILE.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def resolve_server(name):
+    config = load_servers()
+    if name not in config["servers"]:
+        sys.exit(f"Server '{name}' not found. Run './cluster-tool connect {name} --host ...' first.")
+    return config["servers"][name]["host"]
+
+SERVER_CONFIG_DIR = "~/.config/cluster-tool"
+SERVER_STATE_FILE = f"{SERVER_CONFIG_DIR}/state.json"
 SUBNET_START = 160
 SUBNET_SECONDARY_OFFSET = 18
 VM_IP_SUFFIX = 10
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
+
+
+class ExecutionEnv:
+    def __init__(self, *, host, host_ip):
+        self.host = host
+        self.host_ip = host_ip
+        self.is_local = (host == "local")
+
+    def run(self, cmd, *, check=True):
+        if self.is_local:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        else:
+            r = subprocess.run(
+                ["ssh"] + SSH_OPTS + [self.host, cmd],
+                capture_output=True, text=True,
+            )
+        if check and r.returncode != 0:
+            sys.exit(f"Command failed (exit {r.returncode}): {cmd}\n{r.stderr.strip()}")
+        return r
+
+    def run_vm(self, vm_ip, cmd, *, check=True, identity=None):
+        id_opts = ["-i", identity] if identity else []
+        if self.is_local:
+            r = subprocess.run(
+                ["ssh"] + SSH_OPTS + id_opts + [f"core@{vm_ip}", cmd],
+                capture_output=True, text=True,
+            )
+            if check and r.returncode != 0:
+                sys.exit(f"SSH command failed (exit {r.returncode}): {cmd}\n{r.stderr.strip()}")
+            return r
+        id_flag = f"-i {identity} " if identity else ""
+        jump = f"ssh {' '.join(SSH_OPTS)} {id_flag}core@{vm_ip} '{cmd}'"
+        return self.run(jump, check=check)
+
+    def copy_from(self, remote_path, local_path):
+        if self.is_local:
+            subprocess.run(["cp", str(remote_path), str(local_path)], check=True)
+        else:
+            subprocess.run(
+                ["scp"] + SSH_OPTS + [f"{self.host}:{remote_path}", str(local_path)],
+                capture_output=True, text=True, check=True,
+            )
+
+    def write_file(self, path, content):
+        if self.is_local:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(content)
+        else:
+            encoded = base64.b64encode(content.encode()).decode()
+            self.run(f"echo '{encoded}' | base64 -d > {path}")
+
+
+env = None
+
+
+def build_manifest(*, flavor_name, metadata, disk_names):
+    return {
+        "version": 1,
+        "flavor": flavor_name,
+        "disks": [{"name": d, "prefix": d.replace(".qcow2", "")} for d in disk_names],
+        "metadata": metadata,
+    }
+
+
+def parse_manifest(raw):
+    manifest = json.loads(raw) if isinstance(raw, str) else raw
+    for key in ("version", "flavor", "disks", "metadata"):
+        if key not in manifest:
+            sys.exit(f"Invalid manifest: missing '{key}'")
+    for disk in manifest["disks"]:
+        if "name" not in disk or "prefix" not in disk:
+            sys.exit(f"Invalid manifest: disk entry missing 'name' or 'prefix'")
+    return manifest
+
+
 RECERT_IMAGE = "quay.io/rh-ee-ovishlit/recert:latest"
 ETCD_IMAGE = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:96e7c7f2ccac380f0b57c6b3be73c09df05d46b3ff7864acb1ba4fc063d72508"
 DNSMASQ_DIR = Path("/etc/NetworkManager/dnsmasq.d")
 
 
 def load_state():
-    if LOCAL_STATE_FILE.exists():
-        return json.loads(LOCAL_STATE_FILE.read_text())
-    return {"flavors": {}, "clones": {}, "next_subnet": SUBNET_START}
+    r = env.run(f"cat {SERVER_STATE_FILE}", check=False)
+    if r.returncode != 0:
+        return {"flavors": {}, "clones": {}, "next_subnet": SUBNET_START}
+    return json.loads(r.stdout)
 
 
 def save_state(state):
-    LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    LOCAL_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+    env.run(f"mkdir -p {SERVER_CONFIG_DIR}")
+    env.write_file(SERVER_STATE_FILE, json.dumps(state, indent=2) + "\n")
 
 
 @contextmanager
 def locked_state():
-    LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = LOCAL_STATE_DIR / "state.lock"
+    CLIENT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CLIENT_CONFIG_DIR / "state.lock"
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         state = load_state()
@@ -66,8 +178,8 @@ def locked_state():
 
 @contextmanager
 def locked_haproxy():
-    LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = LOCAL_STATE_DIR / "haproxy.lock"
+    CLIENT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CLIENT_CONFIG_DIR / "haproxy.lock"
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         yield
@@ -113,7 +225,7 @@ def parse_disk_paths(dumpxml_output, pool_name):
         if source.get("file"):
             path = source.get("file")
         elif source.get("pool") and source.get("volume"):
-            r = ssh_baremetal(f"virsh vol-path --pool {source.get('pool')} {source.get('volume')}")
+            r = env.run(f"virsh vol-path --pool {source.get('pool')} {source.get('volume')}")
             path = r.stdout.strip()
         if path:
             disks.append({"target": target.get("dev"), "path": path})
@@ -235,6 +347,57 @@ def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=6
         </domain>""")
 
 
+HAPROXY_BASE_CONFIG = textwrap.dedent("""\
+    global
+        log         127.0.0.1 local2
+        chroot      /var/lib/haproxy
+        pidfile     /var/run/haproxy.pid
+        maxconn     4000
+        user        haproxy
+        group       haproxy
+        daemon
+        stats socket /var/lib/haproxy/stats
+
+    defaults
+        mode                    tcp
+        log                     global
+        option                  tcplog
+        option                  dontlognull
+        retries                 3
+        timeout connect         10s
+        timeout client          1m
+        timeout server          1m
+        maxconn                 3000
+
+    frontend api
+        bind *:6443
+        tcp-request inspect-delay 5s
+        tcp-request content accept if { req_ssl_hello_type 1 }
+        default_backend api-fallback
+
+    backend api-fallback
+        server fallback 127.0.0.1:1 check
+
+    frontend ingress-https
+        bind *:443
+        tcp-request inspect-delay 5s
+        tcp-request content accept if { req_ssl_hello_type 1 }
+        default_backend ingress-https-fallback
+
+    backend ingress-https-fallback
+        server fallback 127.0.0.1:1 check
+
+    frontend ingress-http
+        bind *:80
+        mode http
+        default_backend ingress-http-fallback
+
+    backend ingress-http-fallback
+        mode http
+        server fallback 127.0.0.1:1 check
+    """)
+
+
 def gen_haproxy_additions(clone_id, subnet):
     ip = f"192.168.{subnet}.{VM_IP_SUFFIX}"
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
@@ -257,7 +420,7 @@ def gen_haproxy_additions(clone_id, subnet):
 
 def gen_dnsmasq_conf(clone_id):
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
-    return f"address=/{domain}/{BAREMETAL_IP}\n"
+    return f"address=/{domain}/{env.host_ip}\n"
 
 
 def print_step(num, total, desc, status=""):
@@ -267,42 +430,15 @@ def print_step(num, total, desc, status=""):
         print(f"  [{num}/{total}] {desc:<40s}", end="", flush=True)
 
 
-def ssh_baremetal(cmd, check=True):
-    r = subprocess.run(
-        ["ssh"] + SSH_OPTS + [BAREMETAL_HOST, cmd],
-        capture_output=True, text=True,
-    )
-    if check and r.returncode != 0:
-        sys.exit(f"SSH command failed (exit {r.returncode}): {cmd}\n{r.stderr.strip()}")
-    return r
-
-
-def ssh_vm(vm_ip, cmd, check=True):
-    jump = f"ssh {' '.join(SSH_OPTS)} core@{vm_ip} '{cmd}'"
-    return ssh_baremetal(jump, check=check)
-
-
-def scp_from_baremetal(remote_path, local_path):
-    subprocess.run(
-        ["scp"] + SSH_OPTS + [f"{BAREMETAL_HOST}:{remote_path}", str(local_path)],
-        capture_output=True, text=True, check=True,
-    )
-
-
-def write_remote_file(path, content):
-    encoded = base64.b64encode(content.encode()).decode()
-    ssh_baremetal(f"echo '{encoded}' | base64 -d > {path}")
-
-
 def destroy_vm(vm_name):
-    r = ssh_baremetal(f"virsh domstate {vm_name}", check=False)
+    r = env.run(f"virsh domstate {vm_name}", check=False)
     if r.returncode != 0:
         return
     if "shut off" in r.stdout:
-        ssh_baremetal(f"virsh undefine {vm_name}")
+        env.run(f"virsh undefine {vm_name}")
         return
-    ssh_baremetal(f"virsh destroy {vm_name}")
-    ssh_baremetal(f"virsh undefine {vm_name}")
+    env.run(f"virsh destroy {vm_name}")
+    env.run(f"virsh undefine {vm_name}")
 
 
 def _strip_haproxy_clone(config, clone_id):
@@ -334,7 +470,7 @@ def _strip_haproxy_clone(config, clone_id):
 def add_haproxy_clone(clone_id, subnet):
     with locked_haproxy():
         use_backends, backends = gen_haproxy_additions(clone_id, subnet)
-        result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
+        result = env.run("cat /etc/haproxy/haproxy.cfg")
         config = _strip_haproxy_clone(result.stdout, clone_id)
 
         for key in ["api", "ingress-https", "ingress-http"]:
@@ -342,16 +478,16 @@ def add_haproxy_clone(clone_id, subnet):
             config = config.replace(marker, f"{use_backends[key]}\n\n{marker}", 1)
 
         config = config.rstrip() + "\n" + backends
-        write_remote_file("/etc/haproxy/haproxy.cfg", config)
-        ssh_baremetal("systemctl reload haproxy")
+        env.write_file("/etc/haproxy/haproxy.cfg", config)
+        env.run("systemctl reload haproxy")
 
 
 def remove_haproxy_clone(clone_id):
     with locked_haproxy():
-        result = ssh_baremetal("cat /etc/haproxy/haproxy.cfg")
+        result = env.run("cat /etc/haproxy/haproxy.cfg")
         config = _strip_haproxy_clone(result.stdout, clone_id)
-        write_remote_file("/etc/haproxy/haproxy.cfg", config)
-        ssh_baremetal("systemctl reload haproxy")
+        env.write_file("/etc/haproxy/haproxy.cfg", config)
+        env.run("systemctl reload haproxy")
 
 
 def add_dns_entry(clone_id):
@@ -366,12 +502,13 @@ def remove_dns_entry(clone_id):
     subprocess.run(["nmcli", "general", "reload"], check=True)
 
 
-def verify_cluster_identity(vm_ip, expected_id, expected_domain):
+def verify_cluster_identity(vm_ip, expected_id, expected_domain, *, identity=None):
     kc = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
-    r = ssh_vm(vm_ip,
+    r = env.run_vm(vm_ip,
         f"sudo oc --kubeconfig={kc} --insecure-skip-tls-verify "
         f"get infrastructure cluster "
-        f'-o jsonpath="{{.status.apiServerURL}}"')
+        f'-o jsonpath="{{.status.apiServerURL}}"',
+        identity=identity)
     api_url = r.stdout.strip()
     if expected_domain not in api_url:
         sys.exit(
@@ -393,84 +530,94 @@ def cmd_snapshot(args):
     fdir = flavor_dir(flavor_name)
     crypto = flavor_crypto_dir(flavor_name)
 
-    r = ssh_baremetal(f"virsh dominfo {vm_name}")
+    r = env.run(f"virsh dominfo {vm_name}")
     dominfo = parse_dominfo(r.stdout)
 
-    r = ssh_baremetal(f"virsh dumpxml {vm_name}")
+    r = env.run(f"virsh dumpxml {vm_name}")
     disks = parse_disk_paths(r.stdout, f"test-infra-cluster-{source_id}")
 
-    r = ssh_baremetal(f"virsh net-dumpxml test-infra-net-{source_id}")
+    r = env.run(f"virsh net-dumpxml test-infra-net-{source_id}")
     src_primary_subnet = parse_subnet(r.stdout)
-    r = ssh_baremetal(f"virsh net-dumpxml test-infra-secondary-network-{source_id}")
+    r = env.run(f"virsh net-dumpxml test-infra-secondary-network-{source_id}")
     src_secondary_subnet = parse_subnet(r.stdout)
 
     vm_ip = f"192.168.{src_primary_subnet}.{VM_IP_SUFFIX}"
 
-    r = ssh_baremetal(f"virsh domstate {vm_name}")
+    r = env.run(f"virsh domstate {vm_name}")
     vm_state = r.stdout.strip()
     if vm_state != "running":
         sys.exit(f"Source VM '{vm_name}' is '{vm_state}', expected 'running'")
 
     print(f"Creating snapshot flavor '{flavor_name}' from {vm_name}...")
 
-    print_step(1, 6, "Detecting etcd image")
-    etcd_r = ssh_vm(vm_ip,
+    print_step(1, 8, "Detecting etcd image")
+    etcd_r = env.run_vm(vm_ip,
         "sudo python3 -c \""
         "import json; "
         "d=json.load(open('/etc/kubernetes/manifests/etcd-pod.yaml')); "
         "print(next(c['image'] for c in d['spec']['containers'] if c['name']=='etcd'))\"",
         check=False)
     etcd_image = etcd_r.stdout.strip() if etcd_r.returncode == 0 and etcd_r.stdout.strip() else ETCD_IMAGE
-    print_step(1, 6, "Detecting etcd image", "done")
+    print_step(1, 8, "Detecting etcd image", "done")
 
-    print_step(2, 6, "Extracting crypto keys")
+    print_step(2, 8, "Extracting crypto keys")
     node_kc = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
     temp_kc = f"/tmp/kubeconfig-{source_id}"
-    ssh_baremetal(f"ssh {' '.join(SSH_OPTS)} core@{vm_ip} 'sudo cat {node_kc}' > {temp_kc}")
+    env.run(f"ssh {' '.join(SSH_OPTS)} core@{vm_ip} 'sudo cat {node_kc}' > {temp_kc}")
     oc = f"KUBECONFIG={temp_kc} oc --insecure-skip-tls-verify --server=https://{vm_ip}:6443"
-    ssh_baremetal(f"mkdir -p {crypto}")
+    env.run(f"mkdir -p {crypto}")
     for secret, ns, dest in [
         ("loadbalancer-serving-signer", "openshift-kube-apiserver-operator", "lb-signer.key"),
         ("localhost-serving-signer", "openshift-kube-apiserver-operator", "localhost-signer.key"),
         ("service-network-serving-signer", "openshift-kube-apiserver-operator", "service-network-signer.key"),
         ("router-ca", "openshift-ingress-operator", "ingress.key"),
     ]:
-        ssh_baremetal(f"{oc} extract secret/{secret} -n {ns} --keys=tls.key --to=- > {crypto}/{dest}")
-    ssh_baremetal(f"{oc} extract configmap/admin-kubeconfig-client-ca -n openshift-config --keys=ca-bundle.crt --to=- > {crypto}/admin-kubeconfig-client-ca.crt")
-    ingress_cn = ssh_baremetal(
+        env.run(f"{oc} extract secret/{secret} -n {ns} --keys=tls.key --to=- > {crypto}/{dest}")
+    env.run(f"{oc} extract configmap/admin-kubeconfig-client-ca -n openshift-config --keys=ca-bundle.crt --to=- > {crypto}/admin-kubeconfig-client-ca.crt")
+    ingress_cn = env.run(
         f"{oc} get secret/router-ca -n openshift-ingress-operator "
         f"-o jsonpath='{{.data.tls\\.crt}}' | base64 -d | openssl x509 -noout -subject | sed 's/subject=CN *= *//'")
     if not ingress_cn.stdout.strip():
         sys.exit("Failed to extract ingress operator CN")
-    ssh_baremetal(f"echo '{ingress_cn.stdout.strip()}' > {crypto}/ingress-cn.txt")
-    ssh_baremetal(f"rm -f {temp_kc}")
-    print_step(2, 6, "Extracting crypto keys", "done")
+    env.run(f"echo '{ingress_cn.stdout.strip()}' > {crypto}/ingress-cn.txt")
+    env.run(f"rm -f {temp_kc}")
+    print_step(2, 8, "Extracting crypto keys", "done")
 
-    print_step(3, 6, "Shutting down VM")
-    ssh_baremetal(f"virsh shutdown {vm_name}")
+    print_step(3, 8, "Injecting SSH key")
+    pub_key = env.run("cat ~/.config/cluster-tool/cluster-tool.key.pub").stdout.strip()
+    env.run_vm(vm_ip, f"echo '{pub_key}' | sudo tee -a /home/core/.ssh/authorized_keys > /dev/null")
+    print_step(3, 8, "Injecting SSH key", "done")
+
+    print_step(4, 8, "Copying SSH keypair to crypto")
+    env.run(f"cp ~/.config/cluster-tool/cluster-tool.key {crypto}/cluster-tool.key")
+    env.run(f"cp ~/.config/cluster-tool/cluster-tool.key.pub {crypto}/cluster-tool.key.pub")
+    print_step(4, 8, "Copying SSH keypair to crypto", "done")
+
+    print_step(5, 8, "Shutting down VM")
+    env.run(f"virsh shutdown {vm_name}")
     for _ in range(60):
-        r = ssh_baremetal(f"virsh domstate {vm_name}")
+        r = env.run(f"virsh domstate {vm_name}")
         if "shut off" in r.stdout:
             break
         time.sleep(2)
     else:
         sys.exit("VM did not shut down in 2 minutes")
-    print_step(3, 6, "Shutting down VM", "done")
+    print_step(5, 8, "Shutting down VM", "done")
 
-    print_step(4, 6, "Creating directories")
-    ssh_baremetal(f"mkdir -p {fdir} {REMOTE_OVERLAYS}")
-    print_step(4, 6, "Creating directories", "done")
+    print_step(6, 8, "Creating directories")
+    env.run(f"mkdir -p {fdir} {REMOTE_OVERLAYS}")
+    print_step(6, 8, "Creating directories", "done")
 
-    print_step(5, 6, f"Copying {len(disks)} disk(s)")
+    print_step(7, 8, f"Copying {len(disks)} disk(s)")
     for i, disk in enumerate(disks):
         dest = f"{fdir}/disk-{i}.qcow2"
-        ssh_baremetal(f"cp --sparse=always {disk['path']} {dest}")
-        ssh_baremetal(f"chown qemu:qemu {dest}")
-    print_step(5, 6, f"Copying {len(disks)} disk(s)", "done")
+        env.run(f"qemu-img convert -O qcow2 {disk['path']} {dest}")
+        env.run(f"chown qemu:qemu {dest}")
+    print_step(7, 8, f"Copying {len(disks)} disk(s)", "done")
 
-    print_step(6, 6, "Restarting source VM")
-    ssh_baremetal(f"virsh start {vm_name}")
-    print_step(6, 6, "Restarting source VM", "done")
+    print_step(8, 8, "Restarting source VM")
+    env.run(f"virsh start {vm_name}")
+    print_step(8, 8, "Restarting source VM", "done")
 
     with locked_state() as state:
         state["flavors"][flavor_name] = {
@@ -520,6 +667,8 @@ def cmd_boot(args):
     vm_ip = f"192.168.{subnet}.{VM_IP_SUFFIX}"
     vm_name = f"test-infra-cluster-{clone_id}-master-0"
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    key_path = f"{crypto}/cluster-tool.key"
+    env.run(f"chmod 600 {key_path}", check=False)
 
     total = 9
     print(f'Creating clone "{clone_id}"...')
@@ -530,8 +679,8 @@ def cmd_boot(args):
         overlays = []
         for disk_name in disk_names:
             overlay = f"{REMOTE_OVERLAYS}/{clone_id}-{disk_name}"
-            ssh_baremetal(f"qemu-img create -f qcow2 -b {fdir}/{disk_name} -F qcow2 {overlay}")
-            ssh_baremetal(f"chown qemu:qemu {overlay}")
+            env.run(f"qemu-img create -f qcow2 -b {fdir}/{disk_name} -F qcow2 {overlay}")
+            env.run(f"chown qemu:qemu {overlay}")
             cleanup.append(("rm", overlay))
             overlays.append(overlay)
         print_step(1, total, f"Creating {len(disk_names)} disk overlay(s)", "done")
@@ -539,29 +688,29 @@ def cmd_boot(args):
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24")
         primary_xml = gen_primary_network_xml(clone_id, subnet, mac1)
         secondary_xml = gen_secondary_network_xml(clone_id, subnet, subnet_sec, mac2)
-        write_remote_file(f"/tmp/net-{clone_id}.xml", primary_xml)
-        ssh_baremetal(f"virsh net-define /tmp/net-{clone_id}.xml")
+        env.write_file(f"/tmp/net-{clone_id}.xml", primary_xml)
+        env.run(f"virsh net-define /tmp/net-{clone_id}.xml")
         cleanup.append(("net", f"test-infra-net-{clone_id}"))
-        ssh_baremetal(f"virsh net-start test-infra-net-{clone_id}")
-        write_remote_file(f"/tmp/snet-{clone_id}.xml", secondary_xml)
-        ssh_baremetal(f"virsh net-define /tmp/snet-{clone_id}.xml")
+        env.run(f"virsh net-start test-infra-net-{clone_id}")
+        env.write_file(f"/tmp/snet-{clone_id}.xml", secondary_xml)
+        env.run(f"virsh net-define /tmp/snet-{clone_id}.xml")
         cleanup.append(("net", f"test-infra-secondary-network-{clone_id}"))
-        ssh_baremetal(f"virsh net-start test-infra-secondary-network-{clone_id}")
-        ssh_baremetal(f"rm -f /tmp/net-{clone_id}.xml /tmp/snet-{clone_id}.xml")
+        env.run(f"virsh net-start test-infra-secondary-network-{clone_id}")
+        env.run(f"rm -f /tmp/net-{clone_id}.xml /tmp/snet-{clone_id}.xml")
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24", "done")
 
         print_step(3, total, "Booting VM")
         vm_xml = gen_vm_xml(clone_id, overlays, mac1, mac2, memory_kib=memory_kib, vcpus=vcpus)
-        write_remote_file(f"/tmp/vm-{clone_id}.xml", vm_xml)
-        ssh_baremetal(f"virsh define /tmp/vm-{clone_id}.xml")
-        ssh_baremetal(f"virsh start {vm_name}")
+        env.write_file(f"/tmp/vm-{clone_id}.xml", vm_xml)
+        env.run(f"virsh define /tmp/vm-{clone_id}.xml")
+        env.run(f"virsh start {vm_name}")
         cleanup.append(("vm", vm_name))
-        ssh_baremetal(f"rm -f /tmp/vm-{clone_id}.xml")
+        env.run(f"rm -f /tmp/vm-{clone_id}.xml")
         print_step(3, total, "Booting VM", "done")
 
         print_step(4, total, "Waiting for SSH")
         for _ in range(60):
-            if ssh_vm(vm_ip, "echo ready", check=False).returncode == 0:
+            if env.run_vm(vm_ip, "echo ready", check=False, identity=key_path).returncode == 0:
                 break
             time.sleep(5)
         else:
@@ -573,15 +722,15 @@ def cmd_boot(args):
         src_sec_ip = f"192.168.{src_secondary}.{VM_IP_SUFFIX}"
         new_sec_ip = f"192.168.{subnet_sec}.{VM_IP_SUFFIX}"
 
-        ssh_vm(vm_ip, "sudo systemctl stop kubelet")
+        env.run_vm(vm_ip, "sudo systemctl stop kubelet", identity=key_path)
         time.sleep(5)
-        ssh_vm(vm_ip, "sudo systemctl stop crio")
+        env.run_vm(vm_ip, "sudo systemctl stop crio", identity=key_path)
         time.sleep(5)
 
-        ssh_baremetal(f"scp {' '.join(SSH_OPTS)} -r {crypto} core@{vm_ip}:/tmp/crypto")
-        ingress_cn = ssh_baremetal(f"cat {crypto}/ingress-cn.txt").stdout.strip()
+        env.run(f"scp {' '.join(SSH_OPTS)} -i {key_path} -r {crypto} core@{vm_ip}:/tmp/crypto")
+        ingress_cn = env.run(f"cat {crypto}/ingress-cn.txt").stdout.strip()
 
-        ssh_vm(vm_ip,
+        env.run_vm(vm_ip,
             f"sudo podman run -d --name etcd-recert "
             f"--network host --privileged "
             f"-v /var/lib/etcd:/var/lib/etcd "
@@ -590,18 +739,19 @@ def cmd_boot(args):
             f"--listen-client-urls http://localhost:2379 "
             f"--advertise-client-urls http://localhost:2379 "
             f"--listen-peer-urls http://localhost:2380 "
-            f"--force-new-cluster")
+            f"--force-new-cluster",
+            identity=key_path)
 
         for _ in range(30):
-            r = ssh_vm(vm_ip, "curl -sf http://localhost:2379/health 2>/dev/null", check=False)
+            r = env.run_vm(vm_ip, "curl -sf http://localhost:2379/health 2>/dev/null", check=False, identity=key_path)
             if r.returncode == 0:
                 break
             time.sleep(2)
         else:
-            logs = ssh_vm(vm_ip, "sudo podman logs etcd-recert 2>&1 | tail -20", check=False)
+            logs = env.run_vm(vm_ip, "sudo podman logs etcd-recert 2>&1 | tail -20", check=False, identity=key_path)
             sys.exit(f"Standalone etcd not healthy after 60s.\n{logs.stdout}")
 
-        ssh_vm(vm_ip,
+        env.run_vm(vm_ip,
             f"sudo podman run --rm --name recert "
             f"--pull=newer "
             f"--network host --privileged "
@@ -632,9 +782,10 @@ def cmd_boot(args):
             f"--cn-san-replace test-infra-cluster-{source_id}-master-0:{vm_name} "
             f"--cn-san-replace system:node:test-infra-cluster-{source_id}-master-0,system:node:{vm_name} "
             f"--cn-san-replace {src_ip}:{vm_ip} "
-            f"--cn-san-replace {src_sec_ip}:{new_sec_ip}")
+            f"--cn-san-replace {src_sec_ip}:{new_sec_ip}",
+            identity=key_path)
 
-        ssh_vm(vm_ip, "sudo podman stop etcd-recert && sudo podman rm etcd-recert")
+        env.run_vm(vm_ip, "sudo podman stop etcd-recert && sudo podman rm etcd-recert", identity=key_path)
 
         node_fix = (
             f"import pathlib\n"
@@ -654,16 +805,16 @@ def cmd_boot(args):
             f"subprocess.run(['systemctl', 'restart', 'dnsmasq'], check=True)\n"
         )
         fix_b64 = base64.b64encode(node_fix.encode()).decode()
-        ssh_vm(vm_ip, f"echo {fix_b64} | base64 -d | sudo python3")
+        env.run_vm(vm_ip, f"echo {fix_b64} | base64 -d | sudo python3", identity=key_path)
 
-        ssh_vm(vm_ip, "sudo systemctl start crio")
+        env.run_vm(vm_ip, "sudo systemctl start crio", identity=key_path)
         time.sleep(3)
-        ssh_vm(vm_ip, "sudo systemctl start kubelet")
+        env.run_vm(vm_ip, "sudo systemctl start kubelet", identity=key_path)
         print_step(5, total, "Running recert", "done")
 
         print_step(6, total, "Waiting for cluster health")
         for _ in range(120):
-            r = ssh_baremetal(f"curl -sk https://{vm_ip}:6443/healthz", check=False)
+            r = env.run(f"curl -sk https://{vm_ip}:6443/healthz", check=False)
             if r.stdout.strip() == "ok":
                 break
             time.sleep(5)
@@ -674,7 +825,7 @@ def cmd_boot(args):
         print_step(7, total, "Configuring access")
         kubeconfig_path = KUBECONFIG_DIR / f"{clone_id}.kubeconfig"
         KUBECONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        r = ssh_vm(vm_ip, "sudo cat /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
+        r = env.run_vm(vm_ip, "sudo cat /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig", identity=key_path)
         kubeconfig_path.write_text(r.stdout)
 
         kc_content = kubeconfig_path.read_text()
@@ -693,7 +844,7 @@ def cmd_boot(args):
         oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
         node_ready = False
         for _ in range(60):
-            r = ssh_vm(vm_ip, f"{oc_vm} get nodes -o json", check=False)
+            r = env.run_vm(vm_ip, f"{oc_vm} get nodes -o json", check=False, identity=key_path)
             if r.returncode == 0:
                 try:
                     nodes = json.loads(r.stdout)
@@ -707,11 +858,11 @@ def cmd_boot(args):
                 break
             time.sleep(5)
         else:
-            r = ssh_vm(vm_ip, f"{oc_vm} get nodes -o wide", check=False)
+            r = env.run_vm(vm_ip, f"{oc_vm} get nodes -o wide", check=False, identity=key_path)
             sys.exit(f"Node not Ready after 5 minutes.\n{r.stdout}\n{r.stderr}")
         last_unhealthy = []
         for attempt in range(120):
-            r = ssh_vm(vm_ip, f"{oc_vm} get co -o json", check=False)
+            r = env.run_vm(vm_ip, f"{oc_vm} get co -o json", check=False, identity=key_path)
             if r.returncode == 0:
                 try:
                     cos = json.loads(r.stdout)
@@ -737,7 +888,7 @@ def cmd_boot(args):
         print_step(8, total, "Waiting for operators", f"done ({len(items)}/{len(items)})")
 
         print_step(9, total, "Verifying cluster identity")
-        verify_cluster_identity(vm_ip, clone_id, domain)
+        verify_cluster_identity(vm_ip, clone_id, domain, identity=key_path)
         print_step(9, total, "Verifying cluster identity", "done")
 
     except (SystemExit, subprocess.CalledProcessError) as e:
@@ -746,10 +897,10 @@ def cmd_boot(args):
             if kind == "vm":
                 destroy_vm(target)
             elif kind == "net":
-                ssh_baremetal(f"virsh net-destroy {target}")
-                ssh_baremetal(f"virsh net-undefine {target}")
+                env.run(f"virsh net-destroy {target}")
+                env.run(f"virsh net-undefine {target}")
             elif kind == "rm":
-                ssh_baremetal(f"rm -f {target}")
+                env.run(f"rm -f {target}")
             elif kind == "kubeconfig":
                 target.unlink(missing_ok=True)
             elif kind == "haproxy":
@@ -805,13 +956,17 @@ def cmd_verify(args):
     if not kubeconfig_path.exists():
         sys.exit(f"Kubeconfig not found at {kubeconfig_path}")
 
+    crypto = flavor_crypto_dir(info["flavor"])
+    key_path = f"{crypto}/cluster-tool.key"
+    env.run(f"chmod 600 {key_path}", check=False)
+
     print(f'Verifying clone "{clone_id}"...')
     kc = f"/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
     oc_vm = f"sudo oc --kubeconfig={kc} --insecure-skip-tls-verify"
     ns = f"smoke-test-{clone_id}"
 
     print_step(1, 4, "Checking operators")
-    r = ssh_vm(vm_ip, f"{oc_vm} get co -o json")
+    r = env.run_vm(vm_ip, f"{oc_vm} get co -o json", identity=key_path)
     cos = json.loads(r.stdout)
     unhealthy = []
     for co in cos["items"]:
@@ -827,7 +982,7 @@ def cmd_verify(args):
         print_step(1, 4, "Checking operators", f"done ({len(cos['items'])}/{len(cos['items'])})")
 
     print_step(2, 4, "Deploying smoke test pod")
-    ssh_vm(vm_ip, f"{oc_vm} create namespace {ns} 2>/dev/null", check=False)
+    env.run_vm(vm_ip, f"{oc_vm} create namespace {ns} 2>/dev/null", check=False, identity=key_path)
     smoke_cmd = (
         "nslookup kubernetes.default.svc.cluster.local > /dev/null 2>&1 && "
         "echo DNS_CLUSTER=OK || echo DNS_CLUSTER=FAIL; "
@@ -839,24 +994,25 @@ def cmd_verify(args):
         "echo API_ACCESS=OK || echo API_ACCESS=FAIL; "
         "echo SMOKE_DONE"
     )
-    ssh_vm(vm_ip,
+    env.run_vm(vm_ip,
         f"{oc_vm} run smoke-test -n {ns} --restart=Never "
         f"--image=registry.access.redhat.com/ubi9/ubi-minimal:latest "
-        f"--command -- sh -c \"{smoke_cmd}\"")
+        f"--command -- sh -c \"{smoke_cmd}\"",
+        identity=key_path)
     print_step(2, 4, "Deploying smoke test pod", "done")
 
     print_step(3, 4, "Waiting for smoke test")
     for _ in range(30):
-        r = ssh_vm(vm_ip, f"{oc_vm} get pod smoke-test -n {ns} -o jsonpath='{{.status.phase}}'")
+        r = env.run_vm(vm_ip, f"{oc_vm} get pod smoke-test -n {ns} -o jsonpath='{{.status.phase}}'", identity=key_path)
         if r.stdout.strip() in ("Succeeded", "Failed"):
             break
         time.sleep(5)
     else:
-        ssh_vm(vm_ip, f"{oc_vm} delete namespace {ns}")
+        env.run_vm(vm_ip, f"{oc_vm} delete namespace {ns}", identity=key_path)
         sys.exit("Smoke test pod did not complete in 2.5 minutes")
 
-    logs = ssh_vm(vm_ip, f"{oc_vm} logs smoke-test -n {ns}").stdout
-    ssh_vm(vm_ip, f"{oc_vm} delete namespace {ns}")
+    logs = env.run_vm(vm_ip, f"{oc_vm} logs smoke-test -n {ns}", identity=key_path).stdout
+    env.run_vm(vm_ip, f"{oc_vm} delete namespace {ns}", identity=key_path)
     print_step(3, 4, "Waiting for smoke test", "done")
 
     print_step(4, 4, "Results")
@@ -883,7 +1039,7 @@ def cmd_flavors(args):
         with locked_state() as state:
             if name not in state["flavors"]:
                 sys.exit(f'Flavor "{name}" not found.')
-            ssh_baremetal(f"rm -rf {flavor_dir(name)}")
+            env.run(f"rm -rf {flavor_dir(name)}")
             del state["flavors"][name]
             print(f'Flavor "{name}" deleted.')
         return
@@ -916,11 +1072,11 @@ def cmd_destroy(args):
         print(f'Destroying clone "{cid}"...')
 
         destroy_vm(vm)
-        ssh_baremetal(f"virsh net-destroy test-infra-net-{cid}", check=False)
-        ssh_baremetal(f"virsh net-undefine test-infra-net-{cid}", check=False)
-        ssh_baremetal(f"virsh net-destroy test-infra-secondary-network-{cid}", check=False)
-        ssh_baremetal(f"virsh net-undefine test-infra-secondary-network-{cid}", check=False)
-        ssh_baremetal(f"bash -c 'rm -f {REMOTE_OVERLAYS}/{cid}-*.qcow2'")
+        env.run(f"virsh net-destroy test-infra-net-{cid}", check=False)
+        env.run(f"virsh net-undefine test-infra-net-{cid}", check=False)
+        env.run(f"virsh net-destroy test-infra-secondary-network-{cid}", check=False)
+        env.run(f"virsh net-undefine test-infra-secondary-network-{cid}", check=False)
+        env.run(f"bash -c 'rm -f {REMOTE_OVERLAYS}/{cid}-*.qcow2'")
 
         remove_haproxy_clone(cid)
         remove_dns_entry(cid)
@@ -931,7 +1087,314 @@ def cmd_destroy(args):
         print(f'Clone "{cid}" destroyed.')
 
 
+def cmd_push(args):
+    state = load_state()
+    flavor_name = args.name
+    if flavor_name not in state["flavors"]:
+        sys.exit(f"Flavor '{flavor_name}' not found. Available: {', '.join(state['flavors'].keys())}")
+
+    for tool in ("pigz", "podman", "split"):
+        r = env.run(f"command -v {tool}", check=False)
+        if r.returncode != 0:
+            sys.exit(f"Required tool '{tool}' not found on PATH")
+
+    flavor = state["flavors"][flavor_name]
+    disk_names = flavor["disks"]
+    fdir = flavor_dir(flavor_name)
+    crypto = flavor_crypto_dir(flavor_name)
+    image_ref = f"{args.registry}:{args.tag}"
+    tmp = f"{REMOTE_BASE}/tmp-push-{flavor_name}"
+
+    total = 8
+    print(f"Pushing flavor '{flavor_name}' to {image_ref}...")
+    try:
+        print_step(1, total, "Creating temp directory")
+        env.run(f"mkdir -p {tmp}/chunks {tmp}/crypto")
+        print_step(1, total, "Creating temp directory", "done")
+
+        print_step(2, total, f"Splitting {len(disk_names)} disk(s)")
+        for disk_name in disk_names:
+            prefix = disk_name.replace(".qcow2", "")
+            env.run(f"split -b 1G {fdir}/{disk_name} {tmp}/chunks/{prefix}.chunk.")
+        print_step(2, total, f"Splitting {len(disk_names)} disk(s)", "done")
+
+        print_step(3, total, "Compressing chunks")
+        env.run(f"pigz {tmp}/chunks/*.chunk.*")
+        print_step(3, total, "Compressing chunks", "done")
+
+        print_step(4, total, "Copying crypto")
+        env.run(f"cp -r {crypto}/* {tmp}/crypto/")
+        print_step(4, total, "Copying crypto", "done")
+
+        print_step(5, total, "Writing manifest")
+        metadata = {k: v for k, v in flavor.items() if k != "disks"}
+        manifest = build_manifest(flavor_name=flavor_name, metadata=metadata, disk_names=disk_names)
+        env.write_file(f"{tmp}/manifest.json", json.dumps(manifest, indent=2))
+        print_step(5, total, "Writing manifest", "done")
+
+        print_step(6, total, "Generating Dockerfile")
+        r = env.run(f"ls -1 {tmp}/chunks/ | sort")
+        chunk_files = [f for f in r.stdout.strip().split("\n") if f]
+        lines = ["FROM scratch"]
+        lines.append(f"COPY manifest.json /manifest.json")
+        lines.append(f"COPY crypto/ /crypto/")
+        for chunk in chunk_files:
+            lines.append(f"COPY chunks/{chunk} /chunks/{chunk}")
+        env.write_file(f"{tmp}/Dockerfile", "\n".join(lines) + "\n")
+        print_step(6, total, "Generating Dockerfile", "done")
+
+        print_step(7, total, "Building image")
+        env.run(f"{podman(f'build -t {image_ref} {tmp}/')}")
+        print_step(7, total, "Building image", "done")
+
+        print_step(8, total, "Pushing image")
+        env.run(f"{podman(f'push {image_ref}')}")
+        print_step(8, total, "Pushing image", "done")
+
+    finally:
+        env.run(f"rm -rf {tmp}", check=False)
+
+    print(f"\nPushed: {image_ref}")
+
+
+def cmd_pull(args):
+    image_ref = args.image
+
+    for tool in ("pigz", "podman"):
+        r = env.run(f"command -v {tool}", check=False)
+        if r.returncode != 0:
+            sys.exit(f"Required tool '{tool}' not found on PATH")
+
+    container_name = f"cluster-tool-pull-{os.getpid()}"
+    tmp = f"{REMOTE_BASE}/tmp-pull-{os.getpid()}"
+    total = 8
+    print(f"Pulling from {image_ref}...")
+
+    try:
+        print_step(1, total, "Pulling image")
+        env.run(f"{podman(f'pull {image_ref}')}")
+        print_step(1, total, "Pulling image", "done")
+
+        print_step(2, total, "Extracting contents")
+        env.run(f"{podman(f'create --name {container_name} {image_ref}')}")
+        env.run(f"mkdir -p {tmp}")
+        env.run(f"{podman(f'cp {container_name}:/ {tmp}/')}")
+        env.run(f"{podman(f'rm {container_name}')}")
+        print_step(2, total, "Extracting contents", "done")
+
+        print_step(3, total, "Reading manifest")
+        r = env.run(f"cat {tmp}/manifest.json")
+        manifest = parse_manifest(r.stdout)
+        print_step(3, total, "Reading manifest", "done")
+
+        flavor_name = args.name or manifest["flavor"]
+        state = load_state()
+        if flavor_name in state["flavors"]:
+            sys.exit(f"Flavor '{flavor_name}' already exists. Delete it first with 'cluster-tool flavors --delete {flavor_name}'.")
+
+        fdir = flavor_dir(flavor_name)
+        crypto = flavor_crypto_dir(flavor_name)
+
+        print_step(4, total, "Decompressing chunks")
+        env.run(f"ls {tmp}/chunks/*.gz | xargs -P 16 -I{{}} pigz -d {{}}")
+        print_step(4, total, "Decompressing chunks", "done")
+
+        print_step(5, total, "Creating flavor directory")
+        env.run(f"mkdir -p {fdir}")
+        print_step(5, total, "Creating flavor directory", "done")
+
+        print_step(6, total, f"Reassembling {len(manifest['disks'])} disk(s)")
+        for disk in manifest["disks"]:
+            env.run(f"cat {tmp}/chunks/{disk['prefix']}.chunk.* > {fdir}/{disk['name']}")
+            env.run(f"chown qemu:qemu {fdir}/{disk['name']}")
+        print_step(6, total, f"Reassembling {len(manifest['disks'])} disk(s)", "done")
+
+        print_step(7, total, "Installing crypto")
+        env.run(f"mkdir -p {crypto}")
+        env.run(f"cp -r {tmp}/crypto/* {crypto}/")
+        print_step(7, total, "Installing crypto", "done")
+
+        print_step(8, total, "Registering flavor")
+        metadata = manifest["metadata"]
+        disk_names = [d["name"] for d in manifest["disks"]]
+        with locked_state() as state:
+            state["flavors"][flavor_name] = {
+                **metadata,
+                "disks": disk_names,
+            }
+        print_step(8, total, "Registering flavor", "done")
+
+    finally:
+        env.run(f"rm -rf {tmp}", check=False)
+        env.run(f"{podman(f'rm {container_name}')}", check=False)
+        env.run(f"{podman(f'rmi {image_ref}')}", check=False)
+
+    print(f"\nFlavor '{flavor_name}' pulled and registered at {fdir}")
+
+
+def cmd_setup(args):
+    _setup_client()
+
+
+def _setup_client():
+    if os.geteuid() != 0:
+        sys.exit("Run with sudo: sudo ./cluster-tool setup client")
+
+    user = os.environ.get("SUDO_USER", "root")
+
+    print("=== cluster-tool client setup ===")
+
+    print("[1/6] Installing dnsmasq...")
+    subprocess.run(["dnf", "install", "-y", "dnsmasq"], capture_output=True, check=True)
+
+    print("[2/6] Enabling dnsmasq in NetworkManager...")
+    Path("/etc/NetworkManager/conf.d").mkdir(parents=True, exist_ok=True)
+    Path("/etc/NetworkManager/conf.d/cluster-tool-dns.conf").write_text("[main]\ndns=dnsmasq\n")
+
+    print("[3/6] Making dnsmasq config dir writable...")
+    DNSMASQ_DIR.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["chown", user, str(DNSMASQ_DIR)], check=True)
+
+    print("[4/6] Adding polkit rule for NetworkManager reload...")
+    Path("/etc/polkit-1/rules.d").mkdir(parents=True, exist_ok=True)
+    Path("/etc/polkit-1/rules.d/50-cluster-tool-nm.rules").write_text(
+        f'polkit.addRule(function(action, subject) {{\n'
+        f'    if (action.id == "org.freedesktop.NetworkManager.reload" &&\n'
+        f'        subject.user == "{user}") {{\n'
+        f'        return polkit.Result.YES;\n'
+        f'    }}\n'
+        f'}});\n'
+    )
+
+    print("[5/6] Stopping stale dnsmasq processes...")
+    subprocess.run(["pkill", "-x", "dnsmasq"], capture_output=True)
+    time.sleep(1)
+
+    print("[6/6] Restarting NetworkManager...")
+    resolv = Path("/etc/resolv.conf")
+    if resolv.is_symlink():
+        resolv.unlink()
+    subprocess.run(["systemctl", "restart", "NetworkManager"], check=True)
+
+    for _ in range(30):
+        if resolv.exists() and "127.0.0.1" in resolv.read_text():
+            print("  resolv.conf: OK (nameserver 127.0.0.1)")
+            break
+        time.sleep(0.5)
+    else:
+        sys.exit("  resolv.conf: FAILED (expected nameserver 127.0.0.1 after 15s)")
+
+    r = subprocess.run(["su", "-", user, "-c", "nmcli general reload"], capture_output=True)
+    if r.returncode == 0:
+        print("  nmcli reload: OK (no sudo needed)")
+    else:
+        sys.exit("  nmcli reload: FAILED (polkit rule not working)")
+
+    print("\nClient setup complete.")
+
+
+def _setup_server(*, data_path=None):
+    env.run("test $(id -u) -eq 0", check=True)
+    print("=== cluster-tool server setup ===")
+
+    print("[1/6] Installing packages...")
+    env.run("dnf install -y libvirt qemu-kvm podman pigz haproxy")
+
+    print("[2/6] Enabling services...")
+    env.run("systemctl enable --now libvirtd")
+    r = env.run("grep -q 'default_backend api-' /etc/haproxy/haproxy.cfg 2>/dev/null", check=False)
+    if r.returncode != 0:
+        env.write_file("/etc/haproxy/haproxy.cfg", HAPROXY_BASE_CONFIG)
+    env.run("setsebool -P haproxy_connect_any 1")
+    env.run("if systemctl is-active firewalld &>/dev/null; then "
+            "firewall-cmd --permanent --add-port=6443/tcp --add-port=443/tcp --add-port=80/tcp && "
+            "firewall-cmd --reload; fi")
+    env.run("systemctl enable --now haproxy")
+    env.run("systemctl restart haproxy")
+
+    print("[3/6] Generating SSH keypair...")
+    env.run("test -f ~/.config/cluster-tool/cluster-tool.key || "
+            "ssh-keygen -t ed25519 -f ~/.config/cluster-tool/cluster-tool.key -N '' -q")
+
+    print("[4/6] Configuring podman parallel downloads...")
+    env.run("mkdir -p ~/.config/containers")
+    env.run("test -f ~/.config/containers/containers.conf || "
+            "echo -e '[engine]\\nimage_parallel_copies = 20' > ~/.config/containers/containers.conf")
+
+    print("[5/6] Configuring data directory...")
+    r = env.run("cat ~/.config/cluster-tool/config", check=False)
+    if r.returncode == 0:
+        for line in r.stdout.strip().split("\n"):
+            if line.startswith("CLUSTER_TOOL_DATA="):
+                data_path = line.split("=", 1)[1]
+        print(f"  Config already exists, using: {data_path}")
+    else:
+        if not data_path:
+            r2 = env.run("df --output=avail,target -x tmpfs -x devtmpfs | tail -n +2 | sort -rn | head -1 | awk '{print $2}'")
+            largest = r2.stdout.strip()
+            suggested = f"{largest}/cluster-tool"
+            print(f"  Largest partition: {largest}")
+            print(f"  Suggested data path: {suggested}")
+            user_path = input(f"  Data path [{suggested}]: ").strip()
+            data_path = user_path or suggested
+        env.run(f"mkdir -p ~/.config/cluster-tool")
+        env.run(f"echo 'CLUSTER_TOOL_DATA={data_path}' > ~/.config/cluster-tool/config")
+        print(f"  Data path: {data_path}")
+
+    env.run(f"mkdir -p {data_path}/flavors {data_path}/overlays {data_path}/tmp {data_path}/containers/storage")
+
+    print("[6/6] Verifying...")
+    env.run("virsh version | head -1")
+    env.run("podman --version")
+    env.run("pigz --version")
+    r = env.run(f"df -h {data_path} | tail -1 | awk '{{print $4}}'")
+    print(f"  Storage available: {r.stdout.strip()}")
+    print("\nServer setup complete.")
+
+
+def cmd_connect(args):
+    global env
+    host = args.host
+    hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
+    try:
+        host_ip = socket.getaddrinfo(hostname, None)[0][4][0]
+    except socket.gaierror:
+        sys.exit(f"Cannot resolve hostname '{hostname}'.")
+    env = ExecutionEnv(host=host, host_ip=host_ip)
+    _setup_server(data_path=args.data_path)
+    config = load_servers()
+    config["servers"][args.name] = {"host": host}
+    if config["default"] is None:
+        config["default"] = args.name
+    save_servers(config)
+    print(f"\nServer '{args.name}' connected and registered.")
+
+
+def cmd_servers(args):
+    config = load_servers()
+    if not config["servers"]:
+        print("No servers connected. Run './cluster-tool connect NAME --host ...' to add one.")
+        return
+    default = config.get("default")
+    print(f"{'NAME':<20s} {'HOST':<60s} DEFAULT")
+    print("-" * 90)
+    for name, info in config["servers"].items():
+        marker = "*" if name == default else ""
+        print(f"{name:<20s} {info['host']:<60s} {marker}")
+
+
+def cmd_use(args):
+    config = load_servers()
+    if args.name not in config["servers"]:
+        sys.exit(f"Server '{args.name}' not found.")
+    config["default"] = args.name
+    save_servers(config)
+    print(f"Default server set to '{args.name}'.")
+
+
 def main():
+    global env
+
     parser = argparse.ArgumentParser(description="Snapshot-based SNO cluster cloning")
     sub = parser.add_subparsers(dest="command")
 
@@ -943,7 +1406,7 @@ def main():
     boot_p.add_argument("--flavor", help="Flavor to boot from (default: most recent)")
     boot_p.add_argument("--name", help="Clone ID (random if omitted)")
 
-    sub.add_parser("list", help="Show running clones")
+    list_p = sub.add_parser("list", help="Show running clones")
 
     flavors_p = sub.add_parser("flavors", help="List or manage snapshot flavors")
     flavors_p.add_argument("--delete", metavar="NAME", help="Delete a flavor")
@@ -955,12 +1418,77 @@ def main():
     destroy_p.add_argument("name", nargs="?", help="Clone ID to destroy")
     destroy_p.add_argument("--all", action="store_true", help="Destroy all clones")
 
-    args = parser.parse_args()
-    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy}
+    push_p = sub.add_parser("push", help="Push a flavor to an OCI registry")
+    push_p.add_argument("name", help="Flavor name to push")
+    push_p.add_argument("--registry", required=True, help="Registry repo (e.g., quay.io/org/repo)")
+    push_p.add_argument("--tag", required=True, help="Image tag (e.g., sno-cnv, osac-v4.20)")
 
+    pull_p = sub.add_parser("pull", help="Pull a flavor from an OCI registry")
+    pull_p.add_argument("image", help="Full image reference (e.g., quay.io/org/repo:tag)")
+    pull_p.add_argument("--name", help="Local flavor name (default: from manifest)")
+
+    setup_p = sub.add_parser("setup", help="One-time client setup")
+    setup_p.add_argument("mode", choices=["client"], help="'client' for DNS setup")
+
+    connect_p = sub.add_parser("connect", help="Connect to a baremetal server")
+    connect_p.add_argument("name", help="Alias for this server")
+    connect_p.add_argument("--host", required=True, help="SSH target (e.g., root@hostname) or 'local'")
+    connect_p.add_argument("--data-path", help="Data directory (auto-detected if omitted)")
+
+    sub.add_parser("servers", help="List connected servers")
+
+    use_p = sub.add_parser("use", help="Set default server")
+    use_p.add_argument("name", help="Server alias to set as default")
+
+    for p in [snap_p, boot_p, list_p, flavors_p, verify_p, destroy_p, push_p, pull_p]:
+        p.add_argument("--server", help="Server alias (default: from config)")
+
+    args = parser.parse_args()
+    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull}
+
+    if args.command == "setup":
+        cmd_setup(args)
+        return
+    if args.command == "servers":
+        cmd_servers(args)
+        return
+    if args.command == "use":
+        cmd_use(args)
+        return
+    if args.command == "connect":
+        cmd_connect(args)
+        return
     if args.command not in cmds:
         parser.print_help()
         sys.exit(1)
+
+    server_name = getattr(args, "server", None) or os.environ.get("CLUSTER_TOOL_HOST")
+    if not server_name:
+        config = load_servers()
+        server_name = config.get("default")
+    if not server_name:
+        sys.exit("No server specified. Use --server NAME, or set a default with './cluster-tool use NAME'.")
+
+    if "@" in server_name or server_name == "local":
+        host = server_name
+    else:
+        host = resolve_server(server_name)
+
+    hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
+    try:
+        host_ip = socket.getaddrinfo(hostname, None)[0][4][0]
+    except socket.gaierror:
+        sys.exit(f"Cannot resolve hostname '{hostname}'.")
+    env = ExecutionEnv(host=host, host_ip=host_ip)
+
+    r = env.run("cat ~/.config/cluster-tool/config", check=False)
+    if r.returncode != 0:
+        sys.exit(f"Server not set up. Run './cluster-tool connect {server_name} --host ...' first.")
+    for line in r.stdout.strip().split("\n"):
+        if line.startswith("CLUSTER_TOOL_DATA="):
+            _init_paths(line.split("=", 1)[1])
+            break
+
     cmds[args.command](args)
 
 
