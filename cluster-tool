@@ -118,8 +118,9 @@ class ExecutionEnv:
 
     def write_file(self, path, content):
         if self.is_local:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_text(content)
+            resolved = Path(os.path.expanduser(path))
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(content)
         else:
             encoded = base64.b64encode(content.encode()).decode()
             self.run(f"echo '{encoded}' | base64 -d > {path}")
@@ -795,10 +796,16 @@ def cmd_boot(args):
             f"SNO_DNSMASQ_IP_OVERRIDE={vm_ip}\\n')\n"
             f"pathlib.Path('/etc/default/nodeip-configuration').write_text("
             f"'KUBELET_NODEIP_HINT=192.168.{subnet}.0\\n')\n"
-            f"import subprocess\n"
+            f"import subprocess, os\n"
             f"subprocess.run(['hostnamectl', 'set-hostname', '{vm_name}'], check=True)\n"
             f"import shutil\n"
             f"shutil.rmtree('/run/nodeip-configuration', ignore_errors=True)\n"
+            f"for f in ['/etc/openvswitch/conf.db', '/etc/openvswitch/.conf.db.~lock~',\n"
+            f"          '/etc/ovn/ovnsb_db.db', '/etc/ovn/ovnnb_db.db']:\n"
+            f"    try: os.remove(f)\n"
+            f"    except FileNotFoundError: pass\n"
+            f"shutil.rmtree('/var/lib/ovn-ic/etc', ignore_errors=True)\n"
+            f"subprocess.run(['systemctl', 'restart', 'openvswitch'], check=True)\n"
             f"subprocess.run(['systemctl', 'restart', 'nodeip-configuration'], check=True)\n"
             f"subprocess.run(['systemctl', 'daemon-reload'], check=True)\n"
             f"subprocess.run(['systemctl', 'restart', 'NetworkManager'], check=True)\n"
@@ -1290,8 +1297,7 @@ def _setup_client():
 
     print("[6/6] Restarting NetworkManager...")
     resolv = Path("/etc/resolv.conf")
-    if resolv.is_symlink():
-        resolv.unlink()
+    resolv.unlink(missing_ok=True)
     subprocess.run(["systemctl", "restart", "NetworkManager"], check=True)
 
     for _ in range(30):
