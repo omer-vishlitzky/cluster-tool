@@ -551,7 +551,7 @@ def cmd_snapshot(args):
 
     print(f"Creating snapshot flavor '{flavor_name}' from {vm_name}...")
 
-    print_step(1, 8, "Detecting etcd image")
+    print_step(1, 9, "Detecting etcd image")
     etcd_r = env.run_vm(vm_ip,
         "sudo python3 -c \""
         "import json; "
@@ -559,9 +559,9 @@ def cmd_snapshot(args):
         "print(next(c['image'] for c in d['spec']['containers'] if c['name']=='etcd'))\"",
         check=False)
     etcd_image = etcd_r.stdout.strip() if etcd_r.returncode == 0 and etcd_r.stdout.strip() else ETCD_IMAGE
-    print_step(1, 8, "Detecting etcd image", "done")
+    print_step(1, 9, "Detecting etcd image", "done")
 
-    print_step(2, 8, "Extracting crypto keys")
+    print_step(2, 9, "Extracting crypto keys")
     node_kc = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
     temp_kc = f"/tmp/kubeconfig-{source_id}"
     env.run(f"ssh {' '.join(SSH_OPTS)} core@{vm_ip} 'sudo cat {node_kc}' > {temp_kc}")
@@ -582,19 +582,31 @@ def cmd_snapshot(args):
         sys.exit("Failed to extract ingress operator CN")
     env.run(f"echo '{ingress_cn.stdout.strip()}' > {crypto}/ingress-cn.txt")
     env.run(f"rm -f {temp_kc}")
-    print_step(2, 8, "Extracting crypto keys", "done")
+    print_step(2, 9, "Extracting crypto keys", "done")
 
-    print_step(3, 8, "Injecting SSH key")
+    print_step(3, 9, "Injecting SSH key")
     pub_key = env.run("cat ~/.config/cluster-tool/cluster-tool.key.pub").stdout.strip()
     env.run_vm(vm_ip, f"echo '{pub_key}' | sudo tee -a /home/core/.ssh/authorized_keys > /dev/null")
-    print_step(3, 8, "Injecting SSH key", "done")
+    print_step(3, 9, "Injecting SSH key", "done")
 
-    print_step(4, 8, "Copying SSH keypair to crypto")
+    print_step(4, 9, "Copying SSH keypair to crypto")
     env.run(f"cp ~/.config/cluster-tool/cluster-tool.key {crypto}/cluster-tool.key")
     env.run(f"cp ~/.config/cluster-tool/cluster-tool.key.pub {crypto}/cluster-tool.key.pub")
-    print_step(4, 8, "Copying SSH keypair to crypto", "done")
+    print_step(4, 9, "Copying SSH keypair to crypto", "done")
 
-    print_step(5, 8, "Shutting down VM")
+    print_step(5, 9, "Preparing etcd for clean boot")
+    env.run_vm(vm_ip,
+        "cd /etc/kubernetes/static-pod-resources && "
+        "rev=$(ls -d etcd-pod-* 2>/dev/null | sed 's/etcd-pod-//' | sort -n | tail -1) && "
+        "sudo rm -f etcd-certs/etcd-pod.yaml && "
+        "sudo rm -rf etcd-certs/secrets/etcd-all-certs && "
+        "sudo mkdir -p etcd-certs/secrets/etcd-all-certs && "
+        "for f in etcd-pod-${rev}/secrets/etcd-all-certs/*; do "
+        "  sudo ln \"$f\" \"etcd-certs/secrets/etcd-all-certs/$(basename $f)\"; "
+        "done")
+    print_step(5, 9, "Preparing etcd for clean boot", "done")
+
+    print_step(6, 9, "Shutting down VM")
     env.run(f"virsh shutdown {vm_name}")
     for _ in range(60):
         r = env.run(f"virsh domstate {vm_name}")
@@ -603,22 +615,22 @@ def cmd_snapshot(args):
         time.sleep(2)
     else:
         sys.exit("VM did not shut down in 2 minutes")
-    print_step(5, 8, "Shutting down VM", "done")
+    print_step(6, 9, "Shutting down VM", "done")
 
-    print_step(6, 8, "Creating directories")
+    print_step(7, 9, "Creating directories")
     env.run(f"mkdir -p {fdir} {REMOTE_OVERLAYS}")
-    print_step(6, 8, "Creating directories", "done")
+    print_step(7, 9, "Creating directories", "done")
 
-    print_step(7, 8, f"Copying {len(disks)} disk(s)")
+    print_step(8, 9, f"Copying {len(disks)} disk(s)")
     for i, disk in enumerate(disks):
         dest = f"{fdir}/disk-{i}.qcow2"
         env.run(f"qemu-img convert -O qcow2 {disk['path']} {dest}")
         env.run(f"chown qemu:qemu {dest}")
-    print_step(7, 8, f"Copying {len(disks)} disk(s)", "done")
+    print_step(8, 9, f"Copying {len(disks)} disk(s)", "done")
 
-    print_step(8, 8, "Restarting source VM")
+    print_step(9, 9, "Restarting source VM")
     env.run(f"virsh start {vm_name}")
-    print_step(8, 8, "Restarting source VM", "done")
+    print_step(9, 9, "Restarting source VM", "done")
 
     with locked_state() as state:
         state["flavors"][flavor_name] = {
@@ -734,13 +746,12 @@ def cmd_boot(args):
         env.run_vm(vm_ip,
             f"sudo podman run -d --name etcd-recert "
             f"--network host --privileged "
-            f"-v /var/lib/etcd:/var/lib/etcd "
+            f"-v /var/lib/etcd:/store "
+            f"--entrypoint etcd "
             f"{etcd_image} "
-            f"--data-dir /var/lib/etcd "
+            f"--name editor --data-dir /store "
             f"--listen-client-urls http://localhost:2379 "
-            f"--advertise-client-urls http://localhost:2379 "
-            f"--listen-peer-urls http://localhost:2380 "
-            f"--force-new-cluster",
+            f"--advertise-client-urls http://localhost:2379",
             identity=key_path)
 
         for _ in range(30):

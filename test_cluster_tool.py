@@ -594,11 +594,57 @@ class TestTransactionalBoot(unittest.TestCase):
         self.assertIn("restart', 'nodeip-configuration'", script)
         self.assertIn("daemon-reload", script)
         lines = script.strip().split("\n")
-        rmtree_idx = next(i for i, l in enumerate(lines) if "rmtree" in l)
+        rmtree_idx = next(i for i, l in enumerate(lines) if "rmtree" in l and "nodeip" in l)
         restart_idx = next(i for i, l in enumerate(lines) if "nodeip-configuration" in l and "restart" in l)
         daemon_idx = next(i for i, l in enumerate(lines) if "daemon-reload" in l)
         self.assertLess(rmtree_idx, restart_idx)
         self.assertLess(restart_idx, daemon_idx)
+        kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
+        kubeconfig.unlink(missing_ok=True)
+
+    @patch("time.sleep")
+    @patch.object(ct, "add_dns_entry")
+    @patch.object(ct, "add_haproxy_clone")
+    def test_node_fix_cleans_ovn_state(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args())
+
+        b64_cmd = next(cmd for cmd, _ in self.calls if "base64 -d | sudo python3" in cmd)
+        import base64 as b64
+        encoded = b64_cmd.split("echo ")[1].split(" | base64")[0]
+        script = b64.b64decode(encoded).decode()
+        self.assertIn("/etc/openvswitch/conf.db", script)
+        self.assertIn("/etc/openvswitch/.conf.db.~lock~", script)
+        self.assertIn("/etc/ovn/ovnsb_db.db", script)
+        self.assertIn("/etc/ovn/ovnnb_db.db", script)
+        self.assertIn("rmtree('/var/lib/ovn-ic/etc'", script)
+        self.assertIn("restart', 'openvswitch'", script)
+        ovn_rm_idx = next(i for i, l in enumerate(script.split("\n")) if "conf.db" in l)
+        ovs_restart_idx = next(i for i, l in enumerate(script.split("\n")) if "openvswitch" in l and "restart" in l)
+        self.assertLess(ovn_rm_idx, ovs_restart_idx,
+            "OVN database cleanup must happen before openvswitch restart")
+        kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
+        kubeconfig.unlink(missing_ok=True)
+
+    @patch("time.sleep")
+    @patch.object(ct, "add_dns_entry")
+    @patch.object(ct, "add_haproxy_clone")
+    def test_standalone_etcd_uses_store_datadir(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args())
+
+        etcd_cmd = next((cmd for cmd, _ in self.calls if "etcd-recert" in cmd and "podman run" in cmd), None)
+        self.assertIsNotNone(etcd_cmd, "must start standalone etcd container")
+        self.assertIn("-v /var/lib/etcd:/store", etcd_cmd)
+        self.assertIn("--data-dir /store", etcd_cmd)
+        self.assertIn("--name editor", etcd_cmd)
+        self.assertIn("--entrypoint etcd", etcd_cmd)
+        self.assertNotIn("--force-new-cluster", etcd_cmd,
+            "must not use --force-new-cluster (causes unnecessary revision rollouts)")
         kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
         kubeconfig.unlink(missing_ok=True)
 
@@ -953,6 +999,68 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(len(tee_cmds), 1)
         cp_key = [c for c in self.calls if "cp " in c and "cluster-tool.key" in c]
         self.assertEqual(len(cp_key), 2)
+
+    @patch("time.sleep")
+    def test_snapshot_hardlinks_etcd_certs(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        hardlink_cmds = [c for c in self.calls if "sudo ln " in c and "etcd-all-certs" in c]
+        self.assertEqual(len(hardlink_cmds), 1, "snapshot must hardlink etcd-all-certs")
+        cmd = hardlink_cmds[0]
+        self.assertNotIn("-s", cmd.split("ln ")[1].split(" ")[0],
+            "must use hardlinks (ln), not symlinks (ln -s)")
+        self.assertIn("etcd-pod-${rev}/secrets/etcd-all-certs", cmd)
+        self.assertIn("etcd-certs/secrets/etcd-all-certs", cmd)
+
+    @patch("time.sleep")
+    def test_snapshot_removes_stale_etcd_pod_yaml(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        etcd_cleanup = [c for c in self.calls if "rm -f etcd-certs/etcd-pod.yaml" in c]
+        self.assertEqual(len(etcd_cleanup), 1,
+            "snapshot must remove stale etcd-pod.yaml from etcd-certs/")
+
+    @patch("time.sleep")
+    def test_snapshot_hardlink_before_shutdown(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        hardlink_idx = next(i for i, c in enumerate(self.calls) if "sudo ln " in c and "etcd-all-certs" in c)
+        shutdown_idx = next(i for i, c in enumerate(self.calls) if "virsh shutdown" in c)
+        self.assertLess(hardlink_idx, shutdown_idx,
+            "etcd hardlinks must be created before VM shutdown")
+
+    @patch("time.sleep")
+    def test_snapshot_clears_etcd_certs_dir_before_hardlink(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        etcd_prep = [c for c in self.calls if "etcd-all-certs" in c and "etcd-certs" in c]
+        self.assertTrue(len(etcd_prep) >= 1)
+        cmd = etcd_prep[0]
+        rm_pos = cmd.index("rm -rf etcd-certs/secrets/etcd-all-certs")
+        mkdir_pos = cmd.index("mkdir -p etcd-certs/secrets/etcd-all-certs")
+        ln_pos = cmd.index("sudo ln ")
+        self.assertLess(rm_pos, mkdir_pos, "must rm before mkdir")
+        self.assertLess(mkdir_pos, ln_pos, "must mkdir before ln")
 
     @patch("time.sleep")
     def test_snapshot_shuts_down_and_restarts_vm(self, _):
@@ -1379,6 +1487,8 @@ class TestSetupClient(unittest.TestCase):
              patch("pathlib.Path.write_text"), \
              patch("pathlib.Path.read_text", return_value="nameserver 127.0.0.1"), \
              patch("pathlib.Path.mkdir"), \
+             patch("pathlib.Path.unlink"), \
+             patch("pathlib.Path.exists", return_value=True), \
              patch("pathlib.Path.is_symlink", return_value=False):
             ct._setup_client()
 

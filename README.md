@@ -143,7 +143,7 @@ Measured timings (SNO with CNV+LVMS, 90 GB disk):
 2. **Create networks** — isolated libvirt NAT networks with DNS entries. Bridge names truncated to 15-char Linux limit.
 3. **Boot VM** — define and start with the flavor's RAM and vCPU specs.
 4. **Wait for SSH** — poll until reachable using the flavor's SSH key.
-5. **Run recert** — stop kubelet/crio, start standalone etcd, regenerate all certificates, rename cluster identity, fix PV node affinities, configure dnsmasq and nodeip hint, restart services.
+5. **Run recert** — stop kubelet/crio, start standalone etcd (LCA-style, no `--force-new-cluster`), regenerate all certificates, rename cluster identity, fix PV node affinities, clean OVN/OVS state, configure dnsmasq and nodeip hint, restart services.
 6. **Wait for health** — poll `/healthz` until API server is ready.
 7. **Configure access** — extract kubeconfig, add HAProxy SNI entries, add dnsmasq DNS entry.
 8. **Wait for operators** — poll all ClusterOperators until Available and not Degraded.
@@ -157,9 +157,10 @@ If any step fails, all resources are rolled back automatically (transactional bo
 2. **Extract crypto keys** — 4 CA signing keys + admin kubeconfig CA.
 3. **Inject SSH key** — add cluster-tool's public key to the VM's authorized_keys for cross-machine boot.
 4. **Copy SSH keypair** — store in the flavor's crypto dir (travels with push/pull).
-5. **Shut down VM** — graceful shutdown, wait for "shut off".
-6. **Flatten disk(s)** — `qemu-img convert` produces standalone qcow2 (no backing file dependencies).
-7. **Restart VM** — bring the source cluster back up.
+5. **Prepare etcd for clean boot** — hardlink etcd cert files to prevent revision rollouts (see [Snapshot Recloning](#snapshot-recloning) below).
+6. **Shut down VM** — graceful shutdown, wait for "shut off".
+7. **Flatten disk(s)** — `qemu-img convert` produces standalone qcow2 (no backing file dependencies).
+8. **Restart VM** — bring the source cluster back up.
 
 ## Architecture
 
@@ -225,6 +226,63 @@ Each clone gets a fully unique identity through recert:
 - **PV node affinity fix** — PersistentVolumes with node affinity get their hostname replaced in etcd
 - **DNS configuration** — dnsmasq overrides and nodeip hint set via the official override mechanism
 
+## Snapshot Recloning
+
+A snapshot can be booted as a clone, and that clone can be snapshotted again, creating a chain of arbitrary depth (clone-of-clone-of-clone...). Making this work requires handling two subsystems that carry stale state from the previous identity: OVN networking and etcd certificate revisions.
+
+### OVN Networking Cleanup (boot time)
+
+OVN-Kubernetes stores the node's tunnel endpoint IP, connection strings, and system identity in several databases on disk. When a clone boots with a new IP, these stale values prevent OVN from starting — the node stays `NotReady` with "no CNI configuration file."
+
+During boot (after recert, before starting kubelet), the node fix script deletes:
+- `/etc/openvswitch/conf.db` and its lock file — the OVS configuration database with the old IP in `ovn-encap-ip`
+- `/etc/ovn/ovnsb_db.db` and `ovnnb_db.db` — OVN southbound/northbound databases
+- `/var/lib/ovn-ic/etc/` — OVN interconnect state including stale certificates
+
+Then it restarts the `openvswitch` service. On the next boot, `configure-ovs.sh` recreates `br-ex` from scratch, and `ovnkube-node` rebuilds its state with the new IP. The node reaches `Ready` in ~60 seconds.
+
+This follows the same pattern used by the [lifecycle-agent](https://github.com/openshift/lifecycle-agent) (LCA) during Image-Based Install.
+
+### etcd Certificate Revision Hardlinks (snapshot time)
+
+OpenShift's etcd operator uses a revision system for safe rollouts. It keeps two copies of the TLS certificates on disk:
+
+- `etcd-certs/secrets/etcd-all-certs/` — the live certs mounted by the running etcd pod
+- `etcd-pod-{rev}/secrets/etcd-all-certs/` — a revision snapshot from the last successful rollout
+
+The operator periodically compares the live certificates (via the Kubernetes API) against the revision snapshot. If they differ, it triggers a full revision rollout — redeploying the etcd static pod, which cascades to kube-apiserver and other components. This takes ~7 minutes.
+
+**The problem with recloning:** recert regenerates all certificates by scanning the filesystem (`--crypto-dir`) and the etcd database (`--etcd-endpoint`) independently. It deduplicates certificates by content — if two files have identical bytes, recert treats them as one certificate and writes the same regenerated output to both. If the bytes differ, it treats them as separate certificates and generates independent replacements with different serial numbers.
+
+On a first-generation clone (from the original installer), the live certs and revision snapshot are byte-identical. Recert deduplicates them and writes matching output. No rollout.
+
+On a second-generation clone (clone-of-clone), the previous recert already wrote different bytes to each location (because it treated them as separate certs — the same problem, recursively). Now recert sees two different certificates and generates two different replacements. The operator detects the mismatch and triggers a 7-minute rollout.
+
+**The fix:** during `snapshot`, before shutting down the VM, the tool replaces the cert files in `etcd-certs/secrets/etcd-all-certs/` with **hardlinks** to the corresponding files in `etcd-pod-{rev}/secrets/etcd-all-certs/`. Hardlinks are filesystem entries that point to the same physical data on disk (same inode). When recert scans both paths, it finds identical bytes (same inode = same data), deduplicates them into one certificate, and writes one regenerated output. Both paths see the same result. The operator finds no mismatch. No rollout.
+
+Hardlinks (not symlinks) are required because the etcd pod mounts `etcd-certs/` as a container volume. A symlink pointing to `../../etcd-pod-24/` would resolve outside the mount boundary inside the container — the target wouldn't exist. Hardlinks have no path to resolve; they are direct inode references that work identically inside and outside containers.
+
+The hardlinks survive `qemu-img convert` (block-level copy preserves filesystem metadata), qcow2 COW overlays (both directory entries reference the same inode through the overlay), and recert's write mechanism (`std::fs::write` uses `O_TRUNC` which modifies the existing inode in-place without breaking the link).
+
+The etcd operator's cert-sync controller could theoretically break hardlinks via `renameat2(RENAME_EXCHANGE)`, but it has a content-equality check that skips the swap when disk content matches the API. Since recert ensures consistency, the check passes and the hardlinks survive.
+
+This step also removes any stale `etcd-pod.yaml` from `etcd-certs/` — a file the etcd operator's installer pod creates during revision rollouts that would cause recert to crash on subsequent boots.
+
+### Standalone etcd for Recert (boot time)
+
+Recert needs a live etcd endpoint to read and write certificate data. During boot, after stopping kubelet and crio, the tool starts a standalone etcd container:
+
+```
+podman run -d --name etcd-recert \
+  --network host --privileged \
+  -v /var/lib/etcd:/store \
+  --entrypoint etcd \
+  <etcd-image> \
+  --name editor --data-dir /store
+```
+
+The volume mount uses a different container path (`/store` instead of `/var/lib/etcd`) following the lifecycle-agent convention. The `--name editor` flag is ignored by etcd when existing WAL data is present — etcd loads its identity from the WAL metadata. No `--force-new-cluster` flag is used; that flag is designed for multi-member disaster recovery and is unnecessary on a single-node cluster.
+
 ### Forked Recert Image
 
 We use `quay.io/rh-ee-ovishlit/recert:latest` with two fixes over upstream:
@@ -243,8 +301,7 @@ Everything else (libvirt, qemu-kvm, podman, pigz, haproxy) is installed automati
 ## Testing
 
 ```bash
-# Run unit tests (101 tests)
 CLUSTER_TOOL_HOST=test@host python3 test_cluster_tool.py -v
 ```
 
-Tests cover: state management, server registry, ExecutionEnv (local/SSH), template generation, multi-disk VM XML, transactional rollback, recert flags, identity verification, file locking, bridge name truncation, dnsmasq config, manifest build/parse, push command flow, pull command flow, snapshot with SSH key injection, setup client/server, connect/servers/use commands.
+Tests cover: state management, server registry, ExecutionEnv (local/SSH), template generation, multi-disk VM XML, transactional rollback, recert flags, identity verification, file locking, bridge name truncation, dnsmasq config, manifest build/parse, push command flow, pull command flow, snapshot with SSH key injection, snapshot etcd hardlinks, OVN cleanup during boot, standalone etcd configuration, setup client/server, connect/servers/use commands.
