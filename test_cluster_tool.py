@@ -1079,6 +1079,80 @@ class TestSnapshot(unittest.TestCase):
         start_idx = self.calls.index(start[0])
         self.assertLess(shutdown_idx, start_idx)
 
+    @patch("time.sleep")
+    def test_snapshot_prunes_container_images(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        prune_cmds = [c for c in self.calls if "crictl" in c or "podman image prune" in c]
+        self.assertEqual(len(prune_cmds), 1)
+        cmd = prune_cmds[0]
+        self.assertIn("xargs -r sudo crictl rm", cmd)
+        self.assertIn("crictl rmi --prune", cmd)
+        self.assertIn("podman image prune -a -f", cmd)
+
+    @patch("time.sleep")
+    def test_snapshot_prune_before_shutdown(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        prune_idx = next(i for i, c in enumerate(self.calls) if "crictl rmi --prune" in c)
+        shutdown_idx = next(i for i, c in enumerate(self.calls) if "virsh shutdown" in c)
+        self.assertLess(prune_idx, shutdown_idx,
+            "container image pruning must happen before VM shutdown")
+
+    @patch("time.sleep")
+    def test_snapshot_prune_uses_xargs_for_empty_safety(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        prune_cmd = next(c for c in self.calls if "crictl" in c and "xargs" in c)
+        self.assertNotIn("crictl rm $(", prune_cmd,
+            "must not use command substitution — crictl rm with no args is undefined behavior")
+        self.assertIn("xargs -r sudo crictl rm", prune_cmd)
+
+    @patch("time.sleep")
+    def test_snapshot_prune_fails_fast(self, _):
+        prune_called = {"v": False}
+        def ssh_fail_prune(*args, check=True, **kwargs):
+            cmd = args[-1]
+            self.calls.append(cmd)
+            if "crictl" in cmd or "podman image prune" in cmd:
+                prune_called["v"] = True
+                r = MagicMock()
+                r.returncode = 1
+                r.stderr = "prune failed"
+                r.stdout = ""
+                if check:
+                    import sys
+                    sys.exit(f"SSH command failed (exit 1): {cmd}\nprune failed")
+                return r
+            return self._make_ssh_mock()(*args, check=check, **kwargs)
+
+        wrapped = self.mock_env.wrap_run_positional(ssh_fail_prune)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh_fail_prune), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaises(SystemExit):
+                ct.cmd_snapshot(self._snapshot_args())
+
+        self.assertTrue(prune_called["v"])
+        shutdown_cmds = [c for c in self.calls if "virsh shutdown" in c]
+        self.assertEqual(len(shutdown_cmds), 0,
+            "VM must not be shut down if pruning failed")
+
 
 class TestLocking(unittest.TestCase):
     def setUp(self):
