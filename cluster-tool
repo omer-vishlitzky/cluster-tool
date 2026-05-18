@@ -615,13 +615,13 @@ def cmd_snapshot(args):
 
     print_step(7, 10, "Shutting down VM")
     env.run(f"virsh shutdown {vm_name}")
-    for _ in range(60):
+    for _ in range(150):
         r = env.run(f"virsh domstate {vm_name}")
         if "shut off" in r.stdout:
             break
         time.sleep(2)
     else:
-        sys.exit("VM did not shut down in 2 minutes")
+        sys.exit("VM did not shut down in 5 minutes")
     print_step(7, 10, "Shutting down VM", "done")
 
     print_step(8, 10, "Creating directories")
