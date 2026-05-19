@@ -915,8 +915,10 @@ def cmd_boot(args):
                         for co in items:
                             name = co["metadata"]["name"]
                             conds = {c["type"]: c["status"] for c in co["status"]["conditions"]}
-                            if conds.get("Available") != "True" or conds.get("Degraded") == "True":
+                            if conds.get("Available") != "True" or conds.get("Degraded") == "True" or conds.get("Progressing") == "True":
                                 msg = next((c.get("message", "") for c in co["status"]["conditions"] if c["type"] == "Degraded" and c["status"] == "True"), "")
+                                if not msg:
+                                    msg = next((c.get("message", "") for c in co["status"]["conditions"] if c["type"] == "Progressing" and c["status"] == "True"), "")
                                 if not msg:
                                     msg = next((c.get("message", "") for c in co["status"]["conditions"] if c["type"] == "Available" and c["status"] != "True"), "")
                                 last_unhealthy.append(f"{name}: {msg[:120]}")
