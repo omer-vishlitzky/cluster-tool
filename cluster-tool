@@ -519,6 +519,63 @@ def verify_cluster_identity(vm_ip, expected_id, expected_domain, *, identity=Non
         )
 
 
+def cleanup_boot_sources(oc, vm_ip):
+    r = env.run(f"{oc} get hyperconverged kubevirt-hyperconverged -n openshift-cnv -o name", check=False)
+    if r.returncode != 0:
+        print("    No HyperConverged CR found, skipping boot source cleanup")
+        return
+
+    for attempt in range(6):
+        r = env.run(
+            f"{oc} patch hyperconverged kubevirt-hyperconverged -n openshift-cnv "
+            f"--type merge -p '{{\"spec\":{{\"enableCommonBootImageImport\":false}}}}'",
+            check=False)
+        if r.returncode == 0:
+            break
+        time.sleep(10)
+    else:
+        sys.exit("Failed to disable boot source imports after 60s")
+
+    for _ in range(12):
+        r = env.run(f"{oc} get dataimportcron -n openshift-virtualization-os-images --no-headers", check=False)
+        if not r.stdout.strip():
+            break
+        time.sleep(5)
+    print("    DataImportCrons deleted by SSP")
+
+    env.run(f"{oc} delete datavolume -n openshift-virtualization-os-images --all --wait=false", check=False)
+    env.run(f"{oc} delete pvc -n openshift-virtualization-os-images --all --wait=false", check=False)
+
+    r = env.run(f"{oc} get pv --no-headers", check=False)
+    for line in r.stdout.strip().split("\n"):
+        if "Released" in line:
+            pv_name = line.split()[0]
+            env.run(f"{oc} delete pv {pv_name} --wait=false", check=False)
+    print("    Deleted boot source DataVolumes, PVCs, and Released PVs")
+
+    bound_pvcs = env.run(f"{oc} get pvc -A --no-headers -o custom-columns=NAME:.metadata.name", check=False)
+    expected_lvs = set(f"pvc-{line.strip()}" for line in bound_pvcs.stdout.strip().split("\n") if line.strip())
+    for _ in range(18):
+        r = env.run(f"{oc} get logicalvolume --no-headers -o custom-columns=NAME:.metadata.name", check=False)
+        current = set(line.strip() for line in r.stdout.strip().split("\n") if line.strip())
+        orphaned = current - expected_lvs
+        if not orphaned:
+            break
+        time.sleep(10)
+    else:
+        print(f"    Warning: {len(orphaned)} orphaned LogicalVolumes remain after 3 min")
+
+    node_r = env.run(f"{oc} get nodes --no-headers -o custom-columns=NAME:.metadata.name", check=False)
+    if node_r.returncode == 0 and node_r.stdout.strip():
+        node_name = node_r.stdout.strip().split("\n")[0]
+        tp_r = env.run(f"{oc} debug node/{node_name} -- chroot /host bash -c 'lvs --noheadings -o lv_name,data_percent 2>/dev/null | grep thin-pool'", check=False)
+        if tp_r.stdout.strip():
+            print(f"    Thin pool: {tp_r.stdout.strip()}")
+
+    env.run_vm(vm_ip, "sudo fstrim -av")
+    print("    fstrim complete")
+
+
 def cmd_snapshot(args):
     state = load_state()
     flavor_name = args.name
@@ -551,7 +608,7 @@ def cmd_snapshot(args):
 
     print(f"Creating snapshot flavor '{flavor_name}' from {vm_name}...")
 
-    print_step(1, 10, "Detecting etcd image")
+    print_step(1, 11, "Detecting etcd image")
     etcd_r = env.run_vm(vm_ip,
         "sudo python3 -c \""
         "import json; "
@@ -559,9 +616,9 @@ def cmd_snapshot(args):
         "print(next(c['image'] for c in d['spec']['containers'] if c['name']=='etcd'))\"",
         check=False)
     etcd_image = etcd_r.stdout.strip() if etcd_r.returncode == 0 and etcd_r.stdout.strip() else ETCD_IMAGE
-    print_step(1, 10, "Detecting etcd image", "done")
+    print_step(1, 11, "Detecting etcd image", "done")
 
-    print_step(2, 10, "Extracting crypto keys")
+    print_step(2, 11, "Extracting crypto keys")
     node_kc = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
     temp_kc = f"/tmp/kubeconfig-{source_id}"
     env.run(f"ssh {' '.join(SSH_OPTS)} core@{vm_ip} 'sudo cat {node_kc}' > {temp_kc}")
@@ -582,17 +639,17 @@ def cmd_snapshot(args):
         sys.exit("Failed to extract ingress operator CN")
     env.run(f"echo '{ingress_cn.stdout.strip()}' > {crypto}/ingress-cn.txt")
     env.run(f"rm -f {temp_kc}")
-    print_step(2, 10, "Extracting crypto keys", "done")
+    print_step(2, 11, "Extracting crypto keys", "done")
 
-    print_step(3, 10, "Injecting SSH key")
+    print_step(3, 11, "Injecting SSH key")
     pub_key = env.run("cat ~/.config/cluster-tool/cluster-tool.key.pub").stdout.strip()
     env.run_vm(vm_ip, f"echo '{pub_key}' | sudo tee -a /home/core/.ssh/authorized_keys > /dev/null")
-    print_step(3, 10, "Injecting SSH key", "done")
+    print_step(3, 11, "Injecting SSH key", "done")
 
-    print_step(4, 10, "Copying SSH keypair to crypto")
+    print_step(4, 11, "Copying SSH keypair to crypto")
     env.run(f"cp ~/.config/cluster-tool/cluster-tool.key {crypto}/cluster-tool.key")
     env.run(f"cp ~/.config/cluster-tool/cluster-tool.key.pub {crypto}/cluster-tool.key.pub")
-    print_step(4, 10, "Copying SSH keypair to crypto", "done")
+    print_step(4, 11, "Copying SSH keypair to crypto", "done")
 
     print_step(5, 10, "Preparing etcd for clean boot")
     env.run_vm(vm_ip,
@@ -604,16 +661,20 @@ def cmd_snapshot(args):
         "for f in etcd-pod-${rev}/secrets/etcd-all-certs/*; do "
         "  sudo ln \"$f\" \"etcd-certs/secrets/etcd-all-certs/$(basename $f)\"; "
         "done")
-    print_step(5, 10, "Preparing etcd for clean boot", "done")
+    print_step(5, 11, "Preparing etcd for clean boot", "done")
 
-    print_step(6, 10, "Pruning unused container images")
+    print_step(6, 11, "Pruning unused container images")
     env.run_vm(vm_ip,
         "sudo crictl ps -a --state exited -q 2>/dev/null | xargs -r sudo crictl rm && "
         "sudo crictl rmi --prune && "
         "sudo podman image prune -a -f")
-    print_step(6, 10, "Pruning unused container images", "done")
+    print_step(6, 11, "Pruning unused container images", "done")
 
-    print_step(7, 10, "Shutting down VM")
+    print_step(7, 11, "Cleaning up boot sources")
+    cleanup_boot_sources(oc, vm_ip)
+    print_step(7, 11, "Cleaning up boot sources", "done")
+
+    print_step(8, 11, "Shutting down VM")
     env.run(f"virsh shutdown {vm_name}")
     for _ in range(150):
         r = env.run(f"virsh domstate {vm_name}")
@@ -622,22 +683,22 @@ def cmd_snapshot(args):
         time.sleep(2)
     else:
         sys.exit("VM did not shut down in 5 minutes")
-    print_step(7, 10, "Shutting down VM", "done")
+    print_step(8, 11, "Shutting down VM", "done")
 
-    print_step(8, 10, "Creating directories")
+    print_step(9, 11, "Creating directories")
     env.run(f"mkdir -p {fdir} {REMOTE_OVERLAYS}")
-    print_step(8, 10, "Creating directories", "done")
+    print_step(9, 11, "Creating directories", "done")
 
-    print_step(9, 10, f"Copying {len(disks)} disk(s)")
+    print_step(10, 11, f"Copying {len(disks)} disk(s)")
     for i, disk in enumerate(disks):
         dest = f"{fdir}/disk-{i}.qcow2"
         env.run(f"qemu-img convert -O qcow2 {disk['path']} {dest}")
         env.run(f"chown qemu:qemu {dest}")
-    print_step(9, 10, f"Copying {len(disks)} disk(s)", "done")
+    print_step(10, 11, f"Copying {len(disks)} disk(s)", "done")
 
-    print_step(10, 10, "Restarting source VM")
+    print_step(11, 11, "Restarting source VM")
     env.run(f"virsh start {vm_name}")
-    print_step(10, 10, "Restarting source VM", "done")
+    print_step(11, 11, "Restarting source VM", "done")
 
     with locked_state() as state:
         state["flavors"][flavor_name] = {
@@ -1147,7 +1208,9 @@ def cmd_push(args):
     disk_names = flavor["disks"]
     fdir = flavor_dir(flavor_name)
     crypto = flavor_crypto_dir(flavor_name)
-    image_ref = f"{args.registry}:{args.tag}"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    versioned_tag = f"{args.tag}-{timestamp}"
+    image_ref = f"{args.registry}:{versioned_tag}"
     tmp = f"{REMOTE_BASE}/tmp-push-{flavor_name}"
 
     total = 8
@@ -1200,6 +1263,22 @@ def cmd_push(args):
         env.run(f"rm -rf {tmp}", check=False)
 
     print(f"\nPushed: {image_ref}")
+    print(f"To promote: cluster-tool promote {image_ref} --as {args.tag}")
+
+
+def cmd_promote(args):
+    source = args.source
+    target_tag = args.target
+    registry = source.rsplit(":", 1)[0]
+    target_ref = f"{registry}:{target_tag}"
+
+    r = subprocess.run(["command", "-v", "skopeo"], capture_output=True, check=False)
+    if r.returncode != 0:
+        sys.exit("Required tool 'skopeo' not found. Install it with: dnf install skopeo")
+
+    print(f"Promoting {source} -> {target_ref}")
+    subprocess.run(["skopeo", "copy", f"docker://{source}", f"docker://{target_ref}"], check=True)
+    print(f"Promoted: {target_ref}")
 
 
 def cmd_pull(args):
@@ -1472,6 +1551,10 @@ def main():
     pull_p.add_argument("image", help="Full image reference (e.g., quay.io/org/repo:tag)")
     pull_p.add_argument("--name", help="Local flavor name (default: from manifest)")
 
+    promote_p = sub.add_parser("promote", help="Promote a versioned image to a tag (registry-only, no server needed)")
+    promote_p.add_argument("source", help="Full versioned image reference (e.g., quay.io/org/repo:tag-20260522-143000)")
+    promote_p.add_argument("--as", dest="target", required=True, help="Target tag to promote to (e.g., osac-vmaas-pruned)")
+
     setup_p = sub.add_parser("setup", help="One-time client setup")
     setup_p.add_argument("mode", choices=["client"], help="'client' for DNS setup")
 
@@ -1489,7 +1572,7 @@ def main():
         p.add_argument("--server", help="Server alias (default: from config)")
 
     args = parser.parse_args()
-    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull}
+    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull, "promote": cmd_promote}
 
     if args.command == "setup":
         cmd_setup(args)
@@ -1502,6 +1585,9 @@ def main():
         return
     if args.command == "connect":
         cmd_connect(args)
+        return
+    if args.command == "promote":
+        cmd_promote(args)
         return
     if args.command not in cmds:
         parser.print_help()

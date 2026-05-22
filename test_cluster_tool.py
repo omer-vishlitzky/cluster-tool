@@ -1870,5 +1870,71 @@ class TestConfigLoading(unittest.TestCase):
         ct._init_paths("/data/cluster-tool")
 
 
+@unittest.skipUnless(os.environ.get("CLUSTER_TOOL_E2E"), "Set CLUSTER_TOOL_E2E=1 to run")
+class TestBootSourceCleanup(unittest.TestCase):
+    """E2e test: verify snapshot cleans up boot sources.
+
+    Requires a connected server with the dirty snapshot available on Quay.
+    Run: CLUSTER_TOOL_HOST=test@host CLUSTER_TOOL_E2E=1 python3 test_cluster_tool.py TestBootSourceCleanup
+    """
+
+    DIRTY_IMAGE = "quay.io/rh-ee-ovishlit/cluster-flavors:osac-vmaas-pruned-backup-may-21"
+    DIRTY_FLAVOR = "e2e-dirty"
+    CLEAN_FLAVOR = "e2e-clean"
+    BOOT_NAME = "e2e-snap"
+    VERIFY_NAME = "e2e-verify"
+
+    def _run(self, cmd):
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=1800)
+        if r.returncode != 0:
+            self.fail(f"Command failed: {cmd}\nstdout: {r.stdout}\nstderr: {r.stderr}")
+        return r.stdout
+
+    def _run_check(self, cmd):
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=600)
+
+    def _cleanup(self):
+        for name in [self.VERIFY_NAME, self.BOOT_NAME]:
+            subprocess.run(f"./cluster-tool destroy {name}", shell=True, capture_output=True, timeout=120)
+        for flavor in [self.CLEAN_FLAVOR, self.DIRTY_FLAVOR]:
+            subprocess.run(f"./cluster-tool flavors --delete {flavor}", shell=True, capture_output=True, timeout=60)
+
+    def setUp(self):
+        self._cleanup()
+
+    def tearDown(self):
+        self._cleanup()
+
+    def test_snapshot_cleans_boot_sources(self):
+        self._run(f"./cluster-tool pull {self.DIRTY_IMAGE} --name {self.DIRTY_FLAVOR}")
+        self._run(f"./cluster-tool boot --flavor {self.DIRTY_FLAVOR} --name {self.BOOT_NAME}")
+
+        kubeconfig = os.path.expanduser(f"~/.kube/{self.BOOT_NAME}.kubeconfig")
+        oc = f"KUBECONFIG={kubeconfig} oc --insecure-skip-tls-verify"
+
+        r = self._run_check(f"{oc} debug node/$(KUBECONFIG={kubeconfig} oc get nodes --no-headers -o custom-columns=NAME:.metadata.name --insecure-skip-tls-verify) -- chroot /host bash -c 'lvs --noheadings -o data_percent 2>/dev/null | grep -v \"^$\"' | tail -1")
+        pre_pct = float(r.stdout.strip().split()[-1]) if r.returncode == 0 else 0
+        self.assertGreater(pre_pct, 50, f"Expected dirty snapshot thin pool >50%, got {pre_pct}%")
+
+        self._run(f"./cluster-tool snapshot --name {self.CLEAN_FLAVOR} --source {self.BOOT_NAME}")
+        self._run(f"./cluster-tool boot --flavor {self.CLEAN_FLAVOR} --name {self.VERIFY_NAME}")
+
+        kubeconfig_v = os.path.expanduser(f"~/.kube/{self.VERIFY_NAME}.kubeconfig")
+        oc_v = f"KUBECONFIG={kubeconfig_v} oc --insecure-skip-tls-verify"
+
+        r = self._run_check(f"{oc_v} debug node/$(KUBECONFIG={kubeconfig_v} oc get nodes --no-headers -o custom-columns=NAME:.metadata.name --insecure-skip-tls-verify) -- chroot /host bash -c 'lvs --noheadings -o data_percent 2>/dev/null | grep -v \"^$\"' | tail -1")
+        post_pct = float(r.stdout.strip().split()[-1]) if r.returncode == 0 else 100
+        self.assertLess(post_pct, 5, f"Expected clean snapshot thin pool <5%, got {post_pct}%")
+
+        r = self._run_check(f"{oc_v} get dataimportcron -A --no-headers")
+        self.assertEqual(r.stdout.strip(), "", "Expected 0 DataImportCrons")
+
+        r = self._run_check(f"{oc_v} get pvc -n openshift-virtualization-os-images --no-headers")
+        self.assertEqual(r.stdout.strip(), "", "Expected 0 PVCs in os-images namespace")
+
+        r = self._run_check(f"{oc_v} get hyperconverged kubevirt-hyperconverged -n openshift-cnv -o jsonpath='{{.spec.enableCommonBootImageImport}}'")
+        self.assertEqual(r.stdout.strip(), "false", "Expected enableCommonBootImageImport=false")
+
+
 if __name__ == "__main__":
     unittest.main()
