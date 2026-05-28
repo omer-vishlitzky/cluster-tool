@@ -245,19 +245,20 @@ def parse_subnet(net_xml):
 
 def gen_primary_network_xml(clone_id, subnet, mac):
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    ip = f"192.168.{subnet}.{VM_IP_SUFFIX}"
     return textwrap.dedent(f"""\
-        <network>
+        <network xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0">
           <name>test-infra-net-{clone_id}</name>
           <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
           <bridge name='br-{clone_id[:8]}' stp='on' delay='0'/>
           <mtu size='1500'/>
           <domain name='{domain}' localOnly='yes'/>
           <dns enable='yes'>
-            <host ip='192.168.{subnet}.{VM_IP_SUFFIX}'>
+            <host ip='{ip}'>
               <hostname>api-int.{domain}</hostname>
               <hostname>api.{domain}</hostname>
             </host>
-            <host ip='192.168.{subnet}.{VM_IP_SUFFIX}'>
+            <host ip='{ip}'>
               <hostname>oauth-openshift.apps.{domain}</hostname>
               <hostname>console-openshift-console.apps.{domain}</hostname>
               <hostname>canary-openshift-ingress-canary.apps.{domain}</hostname>
@@ -266,27 +267,31 @@ def gen_primary_network_xml(clone_id, subnet, mac):
           <ip family='ipv4' address='192.168.{subnet}.1' prefix='24'>
             <dhcp>
               <range start='192.168.{subnet}.128' end='192.168.{subnet}.254'/>
-              <host mac='{mac}' name='test-infra-cluster-{clone_id}-master-0' ip='192.168.{subnet}.{VM_IP_SUFFIX}'/>
+              <host mac='{mac}' name='test-infra-cluster-{clone_id}-master-0' ip='{ip}'/>
             </dhcp>
           </ip>
+          <dnsmasq:options>
+            <dnsmasq:option value="address=/.apps.{domain}/{ip}"/>
+          </dnsmasq:options>
         </network>""")
 
 
 def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    ip = f"192.168.{subnet_primary}.{VM_IP_SUFFIX}"
     return textwrap.dedent(f"""\
-        <network>
+        <network xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0">
           <name>test-infra-secondary-network-{clone_id}</name>
           <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
           <bridge name='bs-{clone_id[:8]}' stp='on' delay='0'/>
           <mtu size='1500'/>
           <domain name='{domain}' localOnly='yes'/>
           <dns enable='yes'>
-            <host ip='192.168.{subnet_primary}.{VM_IP_SUFFIX}'>
+            <host ip='{ip}'>
               <hostname>api-int.{domain}</hostname>
               <hostname>api.{domain}</hostname>
             </host>
-            <host ip='192.168.{subnet_primary}.{VM_IP_SUFFIX}'>
+            <host ip='{ip}'>
               <hostname>oauth-openshift.apps.{domain}</hostname>
               <hostname>console-openshift-console.apps.{domain}</hostname>
               <hostname>canary-openshift-ingress-canary.apps.{domain}</hostname>
@@ -298,6 +303,9 @@ def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
               <host mac='{mac}' name='test-infra-cluster-{clone_id}-master-0' ip='192.168.{subnet_secondary}.{VM_IP_SUFFIX}'/>
             </dhcp>
           </ip>
+          <dnsmasq:options>
+            <dnsmasq:option value="address=/.apps.{domain}/{ip}"/>
+          </dnsmasq:options>
         </network>""")
 
 
