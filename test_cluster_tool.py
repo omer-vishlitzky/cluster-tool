@@ -167,6 +167,11 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("api.test-infra-cluster-a1b2c3d4.redhat.com", xml)
         self.assertIn("br-a1b2c3d4", xml)
 
+    def test_primary_network_has_apps_wildcard_dns(self):
+        xml = ct.gen_primary_network_xml("a1b2c3d4", 160, "02:00:00:aa:bb:cc")
+        self.assertIn('xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0"', xml)
+        self.assertIn("address=/.apps.test-infra-cluster-a1b2c3d4.redhat.com/192.168.160.10", xml)
+
     def test_primary_network_bridge_name_truncated(self):
         xml = ct.gen_primary_network_xml("caas-pr-cluster", 160, "02:00:00:aa:bb:cc")
         self.assertIn("br-caas-pr-", xml)
@@ -180,6 +185,11 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("192.168.178.10", xml)
         self.assertIn("192.168.160.10", xml)  # DNS points to primary VIP
         self.assertIn("bs-a1b2c3d4", xml)
+
+    def test_secondary_network_has_apps_wildcard_dns(self):
+        xml = ct.gen_secondary_network_xml("a1b2c3d4", 160, 178, "02:00:00:dd:ee:ff")
+        self.assertIn('xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0"', xml)
+        self.assertIn("address=/.apps.test-infra-cluster-a1b2c3d4.redhat.com/192.168.160.10", xml)
 
     def test_secondary_network_bridge_name_truncated(self):
         xml = ct.gen_secondary_network_xml("caas-pr-cluster", 160, 178, "02:00:00:dd:ee:ff")
