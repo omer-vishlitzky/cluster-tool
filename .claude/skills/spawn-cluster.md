@@ -8,6 +8,51 @@ allowed-tools: Bash(cluster-tool *)
 
 Boot fresh OpenShift SNO clusters from golden snapshots in ~5 minutes. Each cluster gets a unique identity (certs, IP, hostname) and is fully independent. Distribute cluster images via OCI registries (Quay.io). Manage multiple baremetal servers.
 
+## Where It Runs
+
+cluster-tool runs on the **user's laptop** and connects to **baremetal servers** via SSH. The laptop is the control plane; VMs run on the server.
+
+- **Remote mode** (typical): commands SSH into the server automatically.
+- **Local mode** (CI / on the server itself): use `--host local` when connecting.
+
+## First-Time Setup
+
+Before any cluster operations, the user needs two things: client DNS setup and a server connection. Check if these are already done before running them.
+
+### 1. Client DNS setup (once per laptop)
+
+```bash
+sudo cluster-tool setup client
+```
+
+Installs dnsmasq and configures NetworkManager so cluster domains resolve automatically. Requires sudo. Only needed once.
+
+**Check if already done:** look for `/etc/NetworkManager/dnsmasq.d/` directory and `/etc/NetworkManager/conf.d/cluster-tool-dns.conf`.
+
+### 2. Connect to a server (once per server)
+
+```bash
+# Remote: from the user's laptop
+cluster-tool connect <alias> --host root@<hostname> --data-path <path>
+
+# Local: running directly on the baremetal machine
+cluster-tool connect <alias> --host local --data-path <path>
+```
+
+Installs all dependencies (libvirt, qemu-kvm, podman, pigz, haproxy), configures storage, and registers the server alias locally.
+
+`--data-path` is where disk images and overlays are stored on the server. Must be on a partition with enough space (~100 GB per flavor). If omitted, the tool auto-detects the largest partition.
+
+**Check if already done:** run `cluster-tool servers` — if the server is listed, it's already connected.
+
+### 3. Set default server (optional)
+
+```bash
+cluster-tool use <alias>
+```
+
+The first server connected is automatically set as default. Only needed if you have multiple servers.
+
 ## Commands
 
 ### Boot a cluster
@@ -17,8 +62,16 @@ cluster-tool boot --flavor <flavor> --name <name> [--server <server>]
 ```
 
 - `--flavor` — which snapshot to boot from. Run `cluster-tool flavors` to see available ones.
-- `--name` — a short identifier (e.g., `pr-1234`, `e2e`). Keep it under 8 chars.
+- `--name` — a short identifier (e.g., `pr-1234`, `e2e`). If omitted, a random 8-char hex ID is generated.
 - `--server` — which server to boot on. Omit to use the default server.
+
+### Get a flavor
+
+If no flavors are available locally, pull one from Quay:
+
+```bash
+cluster-tool pull <image> [--name <name>] [--server <server>]
+```
 
 ### Snapshot a running cluster
 
@@ -51,16 +104,6 @@ cluster-tool connect <name> --host <user@host> --data-path <path>
 cluster-tool servers
 cluster-tool use <name>
 ```
-
-Connect to baremetal servers. `connect` installs all dependencies (libvirt, qemu, podman, pigz, haproxy). `use` sets the default server.
-
-### One-time client setup
-
-```bash
-sudo cluster-tool setup client
-```
-
-Installs dnsmasq for automatic DNS resolution of cluster domains.
 
 ### List / destroy / verify
 
