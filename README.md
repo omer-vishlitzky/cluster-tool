@@ -15,25 +15,109 @@ Flavors can be pushed to an OCI registry (Quay.io) and pulled on any baremetal m
 **Before:** 45 minutes to install a cluster from scratch.
 **After:** ~5 minutes to boot a clone, ~20 minutes including pull from registry.
 
+## Concepts
+
+**Flavor** — A reusable cluster template. It's a directory containing golden qcow2 disk image(s), SSH keys, CA signing keys, and VM specs (RAM, vCPUs). You create a flavor by snapshotting a running cluster, then boot new clusters from it. Examples: `osac-vmaas` (SNO with OSAC VMAAS), `osac-caas` (SNO with OSAC CAAS).
+
+## Installation
+
+```bash
+git clone https://github.com/omer-vishlitzky/cluster-tool.git
+cd cluster-tool
+./cluster-tool --help
+```
+
+Single Python 3 file, stdlib only, no installation needed.
+
+## Requirements
+
+**Client (your laptop):**
+- Linux with NetworkManager (Fedora, RHEL, CentOS). No macOS or Windows support.
+- Python 3
+
+**Server (baremetal):**
+- RHEL, CentOS, or Fedora (uses `dnf`)
+- Root SSH access (passwordless): run `ssh-copy-id root@server` to set up
+- Enough disk space: ~100 GB per flavor, overlays are small (copy-on-write)
+- Enough RAM: each clone uses the flavor's spec (default: 64 GB RAM, 16 vCPUs)
+
+Everything else (libvirt, qemu-kvm, podman, pigz, haproxy) is installed automatically by `connect`.
+
+## Where Does It Run?
+
+cluster-tool runs on your **laptop** and connects to **baremetal servers** (beakers) via SSH. Your laptop is the control plane — it sends commands to the server where VMs actually run.
+
+```
+You (laptop)  --SSH-->  Baremetal server (VMs run here)
+```
+
+**Remote mode** (typical): You run `./cluster-tool` on your laptop. It SSHes into the server to manage VMs, disks, and networks.
+
+**Local mode** (CI / running directly on the server): If you're already on the baremetal machine, use `--host local` when connecting. Commands run directly instead of over SSH.
+
+```bash
+# Remote: from your laptop
+./cluster-tool connect myserver --host root@beaker.example.com --data-path /data/cluster-tool
+
+# Local: from the baremetal machine itself
+./cluster-tool connect local --host local --data-path /data/cluster-tool
+```
+
+**`--data-path`** is the directory on the server where cluster-tool stores everything heavy — golden disk images (60-90 GB each), per-clone overlay disks, and container storage. It must be on a partition with enough space. The root filesystem is often too small; this flag lets you point to a larger disk (e.g., `/data/cluster-tool` or `/home/cluster-tool`). If omitted during `connect`, the tool auto-detects the largest partition and suggests a path.
+
+## Getting a Cluster
+
+### Option 1: Pull an existing flavor (recommended)
+
+Pre-built flavors are available in Quay. Pull one and boot — no need to create a snapshot from scratch.
+
+```bash
+# One-time setup
+sudo ./cluster-tool setup client
+./cluster-tool connect myserver --host root@beaker.example.com --data-path /data/cluster-tool
+
+# Pull a flavor from Quay and boot it
+./cluster-tool pull quay.io/myorg/cluster-flavors:osac-vmaas
+./cluster-tool boot --flavor osac-vmaas --name my-test
+
+# Use it
+export KUBECONFIG=~/.kube/my-test.kubeconfig
+oc get nodes
+```
+
+### Option 2: Create your own flavor
+
+Only needed if you need a custom cluster configuration that doesn't exist as a pre-built flavor. You need a running SNO cluster on the server first — any installation method works ([assisted-test-infra](https://github.com/openshift/assisted-test-infra), Assisted Installer, manual install).
+
+```bash
+# Find the source VM ID on the server:
+# virsh list shows: test-infra-cluster-6ef80144-master-0
+# The source ID is the 8 hex chars: 6ef80144
+
+./cluster-tool snapshot --name my-flavor --source 6ef80144
+./cluster-tool boot --flavor my-flavor --name my-test
+```
+
 ## Quick Start
 
 ```bash
 # One-time setup: configure DNS on your laptop
 sudo ./cluster-tool setup client
 
-# Connect to a baremetal server (--data-path is where flavors and disk images are stored)
+# Connect to a baremetal server
 ./cluster-tool connect myserver --host root@myhost.example.com --data-path /data/cluster-tool
 
-# Create a snapshot from a running SNO cluster
-# The source ID is the cluster ID from the VM name (e.g., test-infra-cluster-6ef80144-master-0 → 6ef80144)
-./cluster-tool snapshot --name sno-64 --source 6ef80144
-
-# Boot a fresh cluster (~5 min)
-./cluster-tool boot --flavor sno-64 --name my-test
+# Pull a pre-built flavor and boot (~15-20 min total)
+./cluster-tool pull quay.io/myorg/cluster-flavors:osac-vmaas
+./cluster-tool boot --flavor osac-vmaas --name my-test
 
 # Use it
 export KUBECONFIG=~/.kube/my-test.kubeconfig
 oc get nodes
+
+# Or create your own flavor from a running SNO cluster
+./cluster-tool snapshot --name sno-64 --source 6ef80144
+./cluster-tool boot --flavor sno-64 --name my-test-2
 
 # Push to Quay for distribution
 ./cluster-tool push sno-64 --registry quay.io/myorg/cluster-flavors --tag sno-64
@@ -84,10 +168,10 @@ For CI, use `local` as the host when running directly on the baremetal machine:
 | `servers` | List all connected servers with default marker. |
 | `use NAME` | Set the default server. |
 | `snapshot --name NAME --source ID` | Create a snapshot flavor from a running cluster. Flattens disks, extracts crypto keys, injects SSH key. The private key is stored in the flavor's `crypto/` dir and travels with push/pull. |
-| `boot --flavor NAME [--name ID] [--server S]` | Boot a fresh clone. Creates overlays, networks, runs recert, waits for operators. |
+| `boot --flavor NAME [--name ID] [--server S]` | Boot a fresh clone. Creates overlays, networks, runs recert, waits for operators. If `--name` is omitted, a random 8-character hex ID is generated. |
 | `list [--server S]` | Show running clones. |
 | `flavors [--delete NAME] [--server S]` | List or delete flavors. |
-| `verify ID [--server S]` | Run smoke tests on a clone. |
+| `verify ID [--server S]` | Deploys a test pod that checks cluster DNS, external DNS resolution, and API access via service account. Reports PASS/FAIL per check. |
 | `destroy ID\|--all [--server S]` | Tear down a clone. |
 | `push NAME --registry REPO --tag TAG [--server S]` | Push a flavor to an OCI registry. Splits, compresses, builds multi-layer image. |
 | `pull IMAGE [--name NAME] [--server S]` | Pull a flavor from an OCI registry. Downloads, decompresses, reassembles, registers. |
@@ -157,7 +241,7 @@ If any step fails, all resources are rolled back automatically (transactional bo
 2. **Extract crypto keys** — 4 CA signing keys + admin kubeconfig CA.
 3. **Inject SSH key** — add cluster-tool's public key to the VM's authorized_keys for cross-machine boot.
 4. **Copy SSH keypair** — store in the flavor's crypto dir (travels with push/pull).
-5. **Prepare etcd for clean boot** — hardlink etcd cert files to prevent revision rollouts (see [Snapshot Recloning](#snapshot-recloning) below).
+5. **Prepare etcd for clean boot** — hardlink etcd cert files to prevent revision rollouts (see [INTERNALS.md](INTERNALS.md)).
 6. **Shut down VM** — graceful shutdown, wait for "shut off".
 7. **Flatten disk(s)** — `qemu-img convert` produces standalone qcow2 (no backing file dependencies).
 8. **Restart VM** — bring the source cluster back up.
@@ -172,8 +256,8 @@ Client (laptop)                      Server (baremetal)
 │ ~/.config/       │                 │ ┌──────────┐  ┌──────────┐         │
 │   cluster-tool/  │                 │ │ my-test  │  │ my-test-2│         │
 │   servers.json   │                 │ │ .160.10  │  │ .161.10  │         │
-│                  │                 │ └──────────┘  └──────────┘         │
-└──────────────────┘                 │                                    │
+└──────────────────┘                 │ └──────────┘  └──────────┘         │
+                                     │                                    │
                                      │ ~/.config/cluster-tool/            │
                                      │   state.json (flavors, clones)     │
                                      │   config (data path)               │
@@ -187,11 +271,17 @@ Client (laptop)                      Server (baremetal)
                                      └────────────────────────────────────┘
 ```
 
-- The tool runs on your laptop or directly on the server (`CLUSTER_TOOL_HOST=local`).
+- The tool runs on your laptop or directly on the server (`--host local`).
 - State (flavors, clones, subnets) lives on the server.
 - Client stores only the server registry (`servers.json`).
 - Each clone gets its own isolated libvirt network with a unique subnet.
-- HAProxy routes API and ingress traffic via SNI.
+- Multiple clones share the server's IP address. HAProxy uses SNI (the hostname in the TLS handshake) to route API and ingress traffic to the correct clone's VM.
+
+## Networking
+
+Clones are assigned subnets sequentially starting from `192.168.160.0/24`. Each clone uses one primary subnet plus a secondary subnet at +18. Subnets are never reused automatically, so the practical limit is ~90 clones per server before the `192.168.x` range is exhausted. Destroyed clones do not free their subnet.
+
+If you hit the limit, destroy all clones and manually reset the counter by editing `state.json` on the server (set `next_subnet` back to `160`).
 
 ## Cross-Machine Boot
 
@@ -226,77 +316,9 @@ Each clone gets a fully unique identity through recert:
 - **PV node affinity fix** — PersistentVolumes with node affinity get their hostname replaced in etcd
 - **DNS configuration** — dnsmasq overrides and nodeip hint set via the official override mechanism
 
-## Snapshot Recloning
+## Internals
 
-A snapshot can be booted as a clone, and that clone can be snapshotted again, creating a chain of arbitrary depth (clone-of-clone-of-clone...). Making this work requires handling two subsystems that carry stale state from the previous identity: OVN networking and etcd certificate revisions.
-
-### OVN Networking Cleanup (boot time)
-
-OVN-Kubernetes stores the node's tunnel endpoint IP, connection strings, and system identity in several databases on disk. When a clone boots with a new IP, these stale values prevent OVN from starting — the node stays `NotReady` with "no CNI configuration file."
-
-During boot (after recert, before starting kubelet), the node fix script deletes:
-- `/etc/openvswitch/conf.db` and its lock file — the OVS configuration database with the old IP in `ovn-encap-ip`
-- `/etc/ovn/ovnsb_db.db` and `ovnnb_db.db` — OVN southbound/northbound databases
-- `/var/lib/ovn-ic/etc/` — OVN interconnect state including stale certificates
-
-Then it restarts the `openvswitch` service. On the next boot, `configure-ovs.sh` recreates `br-ex` from scratch, and `ovnkube-node` rebuilds its state with the new IP. The node reaches `Ready` in ~60 seconds.
-
-This follows the same pattern used by the [lifecycle-agent](https://github.com/openshift/lifecycle-agent) (LCA) during Image-Based Install.
-
-### etcd Certificate Revision Hardlinks (snapshot time)
-
-OpenShift's etcd operator uses a revision system for safe rollouts. It keeps two copies of the TLS certificates on disk:
-
-- `etcd-certs/secrets/etcd-all-certs/` — the live certs mounted by the running etcd pod
-- `etcd-pod-{rev}/secrets/etcd-all-certs/` — a revision snapshot from the last successful rollout
-
-The operator periodically compares the live certificates (via the Kubernetes API) against the revision snapshot. If they differ, it triggers a full revision rollout — redeploying the etcd static pod, which cascades to kube-apiserver and other components. This takes ~7 minutes.
-
-**The problem with recloning:** recert regenerates all certificates by scanning the filesystem (`--crypto-dir`) and the etcd database (`--etcd-endpoint`) independently. It deduplicates certificates by content — if two files have identical bytes, recert treats them as one certificate and writes the same regenerated output to both. If the bytes differ, it treats them as separate certificates and generates independent replacements with different serial numbers.
-
-On a first-generation clone (from the original installer), the live certs and revision snapshot are byte-identical. Recert deduplicates them and writes matching output. No rollout.
-
-On a second-generation clone (clone-of-clone), the previous recert already wrote different bytes to each location (because it treated them as separate certs — the same problem, recursively). Now recert sees two different certificates and generates two different replacements. The operator detects the mismatch and triggers a 7-minute rollout.
-
-**The fix:** during `snapshot`, before shutting down the VM, the tool replaces the cert files in `etcd-certs/secrets/etcd-all-certs/` with **hardlinks** to the corresponding files in `etcd-pod-{rev}/secrets/etcd-all-certs/`. Hardlinks are filesystem entries that point to the same physical data on disk (same inode). When recert scans both paths, it finds identical bytes (same inode = same data), deduplicates them into one certificate, and writes one regenerated output. Both paths see the same result. The operator finds no mismatch. No rollout.
-
-Hardlinks (not symlinks) are required because the etcd pod mounts `etcd-certs/` as a container volume. A symlink pointing to `../../etcd-pod-24/` would resolve outside the mount boundary inside the container — the target wouldn't exist. Hardlinks have no path to resolve; they are direct inode references that work identically inside and outside containers.
-
-The hardlinks survive `qemu-img convert` (block-level copy preserves filesystem metadata), qcow2 COW overlays (both directory entries reference the same inode through the overlay), and recert's write mechanism (`std::fs::write` uses `O_TRUNC` which modifies the existing inode in-place without breaking the link).
-
-The etcd operator's cert-sync controller could theoretically break hardlinks via `renameat2(RENAME_EXCHANGE)`, but it has a content-equality check that skips the swap when disk content matches the API. Since recert ensures consistency, the check passes and the hardlinks survive.
-
-This step also removes any stale `etcd-pod.yaml` from `etcd-certs/` — a file the etcd operator's installer pod creates during revision rollouts that would cause recert to crash on subsequent boots.
-
-### Standalone etcd for Recert (boot time)
-
-Recert needs a live etcd endpoint to read and write certificate data. During boot, after stopping kubelet and crio, the tool starts a standalone etcd container:
-
-```
-podman run -d --name etcd-recert \
-  --network host --privileged \
-  -v /var/lib/etcd:/store \
-  --entrypoint etcd \
-  <etcd-image> \
-  --name editor --data-dir /store
-```
-
-The volume mount uses a different container path (`/store` instead of `/var/lib/etcd`) following the lifecycle-agent convention. The `--name editor` flag is ignored by etcd when existing WAL data is present — etcd loads its identity from the WAL metadata. No `--force-new-cluster` flag is used; that flag is designed for multi-member disaster recovery and is unnecessary on a single-node cluster.
-
-### Forked Recert Image
-
-We use `quay.io/rh-ee-ovishlit/recert:latest` with two fixes over upstream:
-
-1. **Binary DER data handling** — upstream crashes on secrets with binary certificate data. The fork returns `None` for non-UTF-8 data instead of erroring.
-2. **PersistentVolume node affinity** — upstream doesn't update PV node affinity hostnames during `--hostname`. The fork adds PV support in etcd encoding and hostname replacement.
-
-## Prerequisites
-
-- Python 3 (stdlib only, no pip dependencies)
-- SSH access to the baremetal host (passwordless, as root)
-- A running SNO cluster on the baremetal host
-
-Everything else (libvirt, qemu-kvm, podman, pigz, haproxy) is installed automatically by `connect`.
+For deep technical details on how snapshot recloning works (OVN cleanup, etcd certificate hardlinks, standalone etcd, forked recert image), see [INTERNALS.md](INTERNALS.md).
 
 ## Testing
 
