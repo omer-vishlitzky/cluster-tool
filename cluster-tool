@@ -923,8 +923,10 @@ def cmd_boot(args):
                         for co in items:
                             name = co["metadata"]["name"]
                             conds = {c["type"]: c["status"] for c in co["status"]["conditions"]}
-                            if conds.get("Available") != "True" or conds.get("Degraded") == "True":
+                            if conds.get("Available") != "True" or conds.get("Degraded") == "True" or conds.get("Progressing") == "True":
                                 msg = next((c.get("message", "") for c in co["status"]["conditions"] if c["type"] == "Degraded" and c["status"] == "True"), "")
+                                if not msg:
+                                    msg = next((c.get("message", "") for c in co["status"]["conditions"] if c["type"] == "Progressing" and c["status"] == "True"), "")
                                 if not msg:
                                     msg = next((c.get("message", "") for c in co["status"]["conditions"] if c["type"] == "Available" and c["status"] != "True"), "")
                                 last_unhealthy.append(f"{name}: {msg[:120]}")
@@ -1144,7 +1146,7 @@ def cmd_push(args):
     if flavor_name not in state["flavors"]:
         sys.exit(f"Flavor '{flavor_name}' not found. Available: {', '.join(state['flavors'].keys())}")
 
-    for tool in ("pigz", "podman", "split"):
+    for tool in ("zstd", "podman", "split"):
         r = env.run(f"command -v {tool}", check=False)
         if r.returncode != 0:
             sys.exit(f"Required tool '{tool}' not found on PATH")
@@ -1164,13 +1166,16 @@ def cmd_push(args):
         print_step(1, total, "Creating temp directory", "done")
 
         print_step(2, total, f"Splitting {len(disk_names)} disk(s)")
+        chunk_counts = {}
         for disk_name in disk_names:
             prefix = disk_name.replace(".qcow2", "")
             env.run(f"split -b 1G {fdir}/{disk_name} {tmp}/chunks/{prefix}.chunk.")
+            r = env.run(f"ls -1 {tmp}/chunks/{prefix}.chunk.* | wc -l")
+            chunk_counts[disk_name] = int(r.stdout.strip())
         print_step(2, total, f"Splitting {len(disk_names)} disk(s)", "done")
 
         print_step(3, total, "Compressing chunks")
-        env.run(f"pigz {tmp}/chunks/*.chunk.*")
+        env.run(f"ls {tmp}/chunks/*.chunk.* | xargs -P 16 -I{{}} zstd -T1 -3 {{}} --rm")
         print_step(3, total, "Compressing chunks", "done")
 
         print_step(4, total, "Copying crypto")
@@ -1180,6 +1185,9 @@ def cmd_push(args):
         print_step(5, total, "Writing manifest")
         metadata = {k: v for k, v in flavor.items() if k != "disks"}
         manifest = build_manifest(flavor_name=flavor_name, metadata=metadata, disk_names=disk_names)
+        manifest["compression"] = "zstd"
+        for disk in manifest["disks"]:
+            disk["chunk_count"] = chunk_counts[disk["name"]]
         env.write_file(f"{tmp}/manifest.json", json.dumps(manifest, indent=2))
         print_step(5, total, "Writing manifest", "done")
 
@@ -1211,32 +1219,28 @@ def cmd_push(args):
 def cmd_pull(args):
     image_ref = args.image
 
-    for tool in ("pigz", "podman"):
+    for tool in ("skopeo", "zstd", "pigz"):
         r = env.run(f"command -v {tool}", check=False)
         if r.returncode != 0:
             sys.exit(f"Required tool '{tool}' not found on PATH")
 
-    container_name = f"cluster-tool-pull-{os.getpid()}"
     tmp = f"{REMOTE_BASE}/tmp-pull-{os.getpid()}"
-    total = 8
+    total = 5
     print(f"Pulling from {image_ref}...")
 
     try:
-        print_step(1, total, "Pulling image")
-        env.run(f"{podman(f'pull {image_ref}')}")
-        print_step(1, total, "Pulling image", "done")
+        print_step(1, total, "Downloading from registry")
+        env.run(f"mkdir -p {tmp}/oci")
+        env.run(f"skopeo copy docker://{image_ref} dir:{tmp}/oci")
+        print_step(1, total, "Downloading from registry", "done")
 
-        print_step(2, total, "Extracting contents")
-        env.run(f"{podman(f'create --name {container_name} {image_ref}')}")
-        env.run(f"mkdir -p {tmp}")
-        env.run(f"{podman(f'cp {container_name}:/ {tmp}/')}")
-        env.run(f"{podman(f'rm {container_name}')}")
-        print_step(2, total, "Extracting contents", "done")
-
-        print_step(3, total, "Reading manifest")
-        r = env.run(f"cat {tmp}/manifest.json")
+        print_step(2, total, "Reading manifest")
+        r = env.run(f"cat {tmp}/oci/manifest.json")
+        oci_manifest = json.loads(r.stdout)
+        layer_digests = [l["digest"].split(":")[1] for l in oci_manifest["layers"]]
+        r = env.run(f"gzip -dc {tmp}/oci/{layer_digests[0]} | tar xf - -O")
         manifest = parse_manifest(r.stdout)
-        print_step(3, total, "Reading manifest", "done")
+        print_step(2, total, "Reading manifest", "done")
 
         flavor_name = args.name or manifest["flavor"]
         state = load_state()
@@ -1246,26 +1250,36 @@ def cmd_pull(args):
         fdir = flavor_dir(flavor_name)
         crypto = flavor_crypto_dir(flavor_name)
 
-        print_step(4, total, "Decompressing chunks")
-        env.run(f"ls {tmp}/chunks/*.gz | xargs -P 16 -I{{}} pigz -d {{}}")
-        print_step(4, total, "Decompressing chunks", "done")
-
-        print_step(5, total, "Creating flavor directory")
-        env.run(f"mkdir -p {fdir}")
-        print_step(5, total, "Creating flavor directory", "done")
-
-        print_step(6, total, f"Reassembling {len(manifest['disks'])} disk(s)")
-        for disk in manifest["disks"]:
-            env.run(f"cat {tmp}/chunks/{disk['prefix']}.chunk.* > {fdir}/{disk['name']}")
-            env.run(f"chown qemu:qemu {fdir}/{disk['name']}")
-        print_step(6, total, f"Reassembling {len(manifest['disks'])} disk(s)", "done")
-
-        print_step(7, total, "Installing crypto")
+        print_step(3, total, "Installing crypto")
         env.run(f"mkdir -p {crypto}")
-        env.run(f"cp -r {tmp}/crypto/* {crypto}/")
-        print_step(7, total, "Installing crypto", "done")
+        env.run(f"gzip -dc {tmp}/oci/{layer_digests[1]} | tar xf - --strip-components=1 -C {crypto}")
+        print_step(3, total, "Installing crypto", "done")
 
-        print_step(8, total, "Registering flavor")
+        print_step(4, total, f"Reassembling {len(manifest['disks'])} disk(s)")
+        env.run(f"mkdir -p {fdir}")
+
+        compression = manifest.get("compression", "gzip")
+        decompress = "zstd -d" if compression == "zstd" else "pigz -d"
+
+        chunk_digests = layer_digests[2:]
+        offset = 0
+        for disk in manifest["disks"]:
+            count = disk.get("chunk_count")
+            if count is None:
+                sys.exit(f"Manifest missing chunk_count for disk '{disk['name']}'. Re-push with updated cluster-tool.")
+            digests = chunk_digests[offset:offset + count]
+            offset += count
+
+            disk_name = disk["name"]
+            stream = " && ".join(
+                f"gzip -dc {tmp}/oci/{d} | tar xf - -O | {decompress}"
+                for d in digests
+            )
+            env.run(f"bash -c 'set -o pipefail; ({stream}) > {fdir}/{disk_name}'")
+            env.run(f"chown qemu:qemu {fdir}/{disk_name}")
+        print_step(4, total, f"Reassembling {len(manifest['disks'])} disk(s)", "done")
+
+        print_step(5, total, "Registering flavor")
         metadata = manifest["metadata"]
         disk_names = [d["name"] for d in manifest["disks"]]
         with locked_state() as state:
@@ -1273,12 +1287,10 @@ def cmd_pull(args):
                 **metadata,
                 "disks": disk_names,
             }
-        print_step(8, total, "Registering flavor", "done")
+        print_step(5, total, "Registering flavor", "done")
 
     finally:
         env.run(f"rm -rf {tmp}", check=False)
-        env.run(f"{podman(f'rm {container_name}')}", check=False)
-        env.run(f"{podman(f'rmi {image_ref}')}", check=False)
 
     print(f"\nFlavor '{flavor_name}' pulled and registered at {fdir}")
 
@@ -1295,18 +1307,21 @@ def _setup_client():
 
     print("=== cluster-tool client setup ===")
 
-    print("[1/6] Installing dnsmasq...")
+    print("[1/7] Installing dnsmasq...")
     subprocess.run(["dnf", "install", "-y", "dnsmasq"], capture_output=True, check=True)
 
-    print("[2/6] Enabling dnsmasq in NetworkManager...")
+    print("[2/7] Disabling standalone dnsmasq service (NM manages its own)...")
+    subprocess.run(["systemctl", "disable", "--now", "dnsmasq"], capture_output=True)
+
+    print("[3/7] Enabling dnsmasq in NetworkManager...")
     Path("/etc/NetworkManager/conf.d").mkdir(parents=True, exist_ok=True)
     Path("/etc/NetworkManager/conf.d/cluster-tool-dns.conf").write_text("[main]\ndns=dnsmasq\n")
 
-    print("[3/6] Making dnsmasq config dir writable...")
+    print("[4/7] Making dnsmasq config dir writable...")
     DNSMASQ_DIR.mkdir(parents=True, exist_ok=True)
     subprocess.run(["chown", user, str(DNSMASQ_DIR)], check=True)
 
-    print("[4/6] Adding polkit rule for NetworkManager reload...")
+    print("[5/7] Adding polkit rule for NetworkManager reload...")
     Path("/etc/polkit-1/rules.d").mkdir(parents=True, exist_ok=True)
     Path("/etc/polkit-1/rules.d/50-cluster-tool-nm.rules").write_text(
         f'polkit.addRule(function(action, subject) {{\n'
@@ -1317,11 +1332,11 @@ def _setup_client():
         f'}});\n'
     )
 
-    print("[5/6] Stopping stale dnsmasq processes...")
+    print("[6/7] Stopping stale dnsmasq processes...")
     subprocess.run(["pkill", "-x", "dnsmasq"], capture_output=True)
     time.sleep(1)
 
-    print("[6/6] Restarting NetworkManager...")
+    print("[7/7] Restarting NetworkManager...")
     resolv = Path("/etc/resolv.conf")
     resolv.unlink(missing_ok=True)
     subprocess.run(["systemctl", "restart", "NetworkManager"], check=True)
@@ -1348,7 +1363,7 @@ def _setup_server(*, data_path=None):
     print("=== cluster-tool server setup ===")
 
     print("[1/6] Installing packages...")
-    env.run("dnf install -y libvirt qemu-kvm podman pigz haproxy")
+    env.run("dnf install -y libvirt qemu-kvm podman pigz haproxy skopeo zstd")
 
     print("[2/6] Enabling services...")
     env.run("systemctl enable --now libvirtd")
@@ -1398,6 +1413,8 @@ def _setup_server(*, data_path=None):
     env.run("virsh version | head -1")
     env.run("podman --version")
     env.run("pigz --version")
+    env.run("skopeo --version")
+    env.run("zstd --version 2>&1 | head -1")
     r = env.run(f"df -h {data_path} | tail -1 | awk '{{print $4}}'")
     print(f"  Storage available: {r.stdout.strip()}")
     print("\nServer setup complete.")
