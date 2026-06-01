@@ -328,7 +328,7 @@ def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=6
           <currentMemory unit='KiB'>{memory_kib}</currentMemory>
           <vcpu placement='static'>{vcpus}</vcpu>
           <os>
-            <type arch='x86_64' machine='pc-i440fx-rhel7.6.0'>hvm</type>
+            <type arch='x86_64' machine='pc-q35-rhel10.2.0'>hvm</type>
             <boot dev='hd'/>
           </os>
           <features><acpi/><apic/><pae/></features>
