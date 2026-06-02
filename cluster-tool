@@ -905,6 +905,11 @@ def cmd_boot(args):
             else:
                 if attempt % 6 == 0:
                     print(f"\n    [{attempt*5}s] oc get nodes failed (rc={r.returncode})")
+            if not node_ready:
+                csr_approve = env.run_vm(vm_ip, f"{oc_vm} get csr --no-headers 2>/dev/null | grep Pending | awk '{{print $1}}' | xargs -r {oc_vm} adm certificate approve 2>&1", check=False, identity=key_path)
+                if "approved" in csr_approve.stdout:
+                    count = csr_approve.stdout.count("approved")
+                    print(f"\n    Auto-approved {count} pending CSR(s)")
             if node_ready:
                 break
             time.sleep(5)
