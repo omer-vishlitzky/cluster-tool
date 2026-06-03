@@ -1318,24 +1318,33 @@ def _setup_client():
         _setup_client_linux()
 
 
+def _run_as_user(user, cmd):
+    subprocess.run(["su", "-", user, "-c", cmd], check=True)
+
+
 def _setup_client_darwin():
     if os.geteuid() != 0:
         sys.exit("Run with sudo: sudo ./cluster-tool setup client")
 
-    user = os.environ.get("SUDO_USER", "root")
+    user = os.environ.get("SUDO_USER")
+    if not user or user == "root":
+        sys.exit("Run with sudo from a regular user account, not as root directly")
 
     print("=== cluster-tool client setup (macOS) ===")
 
-    brew = subprocess.run(["which", "brew"], capture_output=True, text=True)
-    if brew.returncode != 0:
+    brew_check = subprocess.run(
+        ["su", "-", user, "-c", "which brew"], capture_output=True, text=True
+    )
+    if brew_check.returncode != 0:
         sys.exit("Homebrew is required. Install it from https://brew.sh")
-    brew_bin = brew.stdout.strip()
 
-    prefix_r = subprocess.run(["brew", "--prefix"], capture_output=True, text=True, check=True)
+    prefix_r = subprocess.run(
+        ["su", "-", user, "-c", "brew --prefix"], capture_output=True, text=True, check=True
+    )
     brew_prefix = Path(prefix_r.stdout.strip())
 
     print("[1/6] Installing dnsmasq...")
-    subprocess.run([brew_bin, "install", "dnsmasq"], check=True)
+    _run_as_user(user, "brew install dnsmasq")
 
     print("[2/6] Configuring dnsmasq conf-dir...")
     dnsmasq_dir = brew_prefix / "etc" / "dnsmasq.d"
@@ -1362,7 +1371,8 @@ def _setup_client_darwin():
     subprocess.run(["chmod", "0440", str(sudoers_file)], check=True)
 
     print("[5/6] Starting dnsmasq...")
-    subprocess.run(["brew", "services", "start", "dnsmasq"], check=True)
+    brew_bin = str(brew_prefix / "bin" / "brew")
+    subprocess.run([brew_bin, "services", "start", "dnsmasq"], check=True)
 
     print("[6/6] Verifying...")
     time.sleep(1)
