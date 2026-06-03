@@ -151,7 +151,18 @@ def parse_manifest(raw):
 
 RECERT_IMAGE = "quay.io/rh-ee-ovishlit/recert:latest"
 ETCD_IMAGE = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:96e7c7f2ccac380f0b57c6b3be73c09df05d46b3ff7864acb1ba4fc063d72508"
-DNSMASQ_DIR = Path("/etc/NetworkManager/dnsmasq.d")
+def _dnsmasq_dir():
+    if sys.platform == "darwin":
+        r = subprocess.run(["brew", "--prefix"], capture_output=True, text=True, check=True)
+        return Path(r.stdout.strip()) / "etc" / "dnsmasq.d"
+    return Path("/etc/NetworkManager/dnsmasq.d")
+
+
+def _reload_dns():
+    if sys.platform == "darwin":
+        subprocess.run(["sudo", "killall", "-HUP", "dnsmasq"], check=True)
+    else:
+        _reload_dns()
 
 
 def load_state():
@@ -500,15 +511,15 @@ def remove_haproxy_clone(clone_id):
 
 
 def add_dns_entry(clone_id):
-    conf = DNSMASQ_DIR / f"cluster-{clone_id}.conf"
+    conf = _dnsmasq_dir() / f"cluster-{clone_id}.conf"
     conf.write_text(gen_dnsmasq_conf(clone_id))
-    subprocess.run(["nmcli", "general", "reload"], check=True)
+    _reload_dns()
 
 
 def remove_dns_entry(clone_id):
-    conf = DNSMASQ_DIR / f"cluster-{clone_id}.conf"
+    conf = _dnsmasq_dir() / f"cluster-{clone_id}.conf"
     conf.unlink(missing_ok=True)
-    subprocess.run(["nmcli", "general", "reload"], check=True)
+    _reload_dns()
 
 
 def verify_cluster_identity(vm_ip, expected_id, expected_domain, *, identity=None):
@@ -1301,6 +1312,70 @@ def cmd_setup(args):
 
 
 def _setup_client():
+    if sys.platform == "darwin":
+        _setup_client_darwin()
+    else:
+        _setup_client_linux()
+
+
+def _setup_client_darwin():
+    if os.geteuid() != 0:
+        sys.exit("Run with sudo: sudo ./cluster-tool setup client")
+
+    user = os.environ.get("SUDO_USER", "root")
+
+    print("=== cluster-tool client setup (macOS) ===")
+
+    brew = subprocess.run(["which", "brew"], capture_output=True, text=True)
+    if brew.returncode != 0:
+        sys.exit("Homebrew is required. Install it from https://brew.sh")
+    brew_bin = brew.stdout.strip()
+
+    prefix_r = subprocess.run(["brew", "--prefix"], capture_output=True, text=True, check=True)
+    brew_prefix = Path(prefix_r.stdout.strip())
+
+    print("[1/6] Installing dnsmasq...")
+    subprocess.run([brew_bin, "install", "dnsmasq"], check=True)
+
+    print("[2/6] Configuring dnsmasq conf-dir...")
+    dnsmasq_dir = brew_prefix / "etc" / "dnsmasq.d"
+    dnsmasq_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["chown", user, str(dnsmasq_dir)], check=True)
+    dnsmasq_conf = brew_prefix / "etc" / "dnsmasq.conf"
+    conf_dir_line = f"conf-dir={dnsmasq_dir},*.conf"
+    if dnsmasq_conf.exists() and conf_dir_line in dnsmasq_conf.read_text():
+        print(f"  Already configured in {dnsmasq_conf}")
+    else:
+        with open(dnsmasq_conf, "a") as f:
+            f.write(f"\n{conf_dir_line}\n")
+
+    print("[3/6] Setting up /etc/resolver for *.redhat.com...")
+    resolver_dir = Path("/etc/resolver")
+    resolver_dir.mkdir(parents=True, exist_ok=True)
+    (resolver_dir / "redhat.com").write_text("nameserver 127.0.0.1\n")
+
+    print("[4/6] Adding sudoers rule for dnsmasq reload...")
+    sudoers_dir = Path("/etc/sudoers.d")
+    sudoers_dir.mkdir(parents=True, exist_ok=True)
+    sudoers_file = sudoers_dir / "cluster-tool-dnsmasq"
+    sudoers_file.write_text(f"{user} ALL=(ALL) NOPASSWD: /usr/bin/killall -HUP dnsmasq\n")
+    subprocess.run(["chmod", "0440", str(sudoers_file)], check=True)
+
+    print("[5/6] Starting dnsmasq...")
+    subprocess.run(["brew", "services", "start", "dnsmasq"], check=True)
+
+    print("[6/6] Verifying...")
+    time.sleep(1)
+    r = subprocess.run(["pgrep", "-x", "dnsmasq"], capture_output=True)
+    if r.returncode == 0:
+        print("  dnsmasq: running")
+    else:
+        sys.exit("  dnsmasq: FAILED (process not found)")
+
+    print("\nClient setup complete.")
+
+
+def _setup_client_linux():
     if os.geteuid() != 0:
         sys.exit("Run with sudo: sudo ./cluster-tool setup client")
 
@@ -1316,8 +1391,8 @@ def _setup_client():
     Path("/etc/NetworkManager/conf.d/cluster-tool-dns.conf").write_text("[main]\ndns=dnsmasq\n")
 
     print("[3/6] Making dnsmasq config dir writable...")
-    DNSMASQ_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["chown", user, str(DNSMASQ_DIR)], check=True)
+    _dnsmasq_dir().mkdir(parents=True, exist_ok=True)
+    subprocess.run(["chown", user, str(_dnsmasq_dir())], check=True)
 
     print("[4/6] Adding polkit rule for NetworkManager reload...")
     Path("/etc/polkit-1/rules.d").mkdir(parents=True, exist_ok=True)

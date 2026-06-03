@@ -41,7 +41,7 @@ cluster-tool connect <alias> --host local --data-path <path>
 
 Installs all dependencies (libvirt, qemu-kvm, podman, pigz, haproxy), configures storage, and registers the server alias locally.
 
-`--data-path` is where disk images and overlays are stored on the server. Must be on a partition with enough space (~100 GB per flavor). If omitted, the tool auto-detects the largest partition.
+`--data-path` is where disk images and overlays are stored on the server. Must be on a partition with enough space (~100 GB per flavor). If omitted, the tool prompts interactively with the largest partition as the default. **Always pass `--data-path` explicitly** to avoid interactive prompts — use the largest partition on the server (e.g., `/home/cluster-tool`).
 
 **Check if already done:** run `cluster-tool servers` — if the server is listed, it's already connected.
 
