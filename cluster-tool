@@ -562,8 +562,8 @@ def cmd_snapshot(args):
     print_step(1, 10, "Detecting etcd image")
     etcd_r = env.run_vm(vm_ip,
         "sudo python3 -c \""
-        "import json; "
-        "d=json.load(open('/etc/kubernetes/manifests/etcd-pod.yaml')); "
+        "import yaml, json; "
+        "d=yaml.safe_load(open('/etc/kubernetes/manifests/etcd-pod.yaml')); "
         "print(next(c['image'] for c in d['spec']['containers'] if c['name']=='etcd'))\"",
         check=False)
     etcd_image = etcd_r.stdout.strip() if etcd_r.returncode == 0 and etcd_r.stdout.strip() else ETCD_IMAGE
@@ -617,7 +617,7 @@ def cmd_snapshot(args):
     print_step(6, 10, "Pruning unused container images")
     env.run_vm(vm_ip,
         "sudo crictl ps -a --state exited -q 2>/dev/null | xargs -r sudo crictl rm && "
-        "sudo crictl rmi --prune && "
+        "sudo crictl --timeout 120s rmi --prune && "
         "sudo podman image prune -a -f")
     print_step(6, 10, "Pruning unused container images", "done")
 
@@ -761,6 +761,7 @@ def cmd_boot(args):
         env.run_vm(vm_ip,
             f"sudo podman run -d --name etcd-recert "
             f"--network host --privileged "
+            f"--authfile /var/lib/kubelet/config.json "
             f"-v /var/lib/etcd:/store "
             f"--entrypoint etcd "
             f"{etcd_image} "

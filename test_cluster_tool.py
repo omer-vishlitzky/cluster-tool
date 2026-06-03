@@ -659,6 +659,22 @@ class TestTransactionalBoot(unittest.TestCase):
         kubeconfig.unlink(missing_ok=True)
 
     @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_etcd_recert_uses_authfile(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args())
+
+        etcd_cmd = next((cmd for cmd, _ in self.calls if "etcd-recert" in cmd and "podman run" in cmd), None)
+        self.assertIsNotNone(etcd_cmd)
+        self.assertIn("--authfile /var/lib/kubelet/config.json", etcd_cmd)
+        kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
+        kubeconfig.unlink(missing_ok=True)
+
+    @patch("time.sleep")
     @patch.object(ct, "add_dns_entry")
     def test_identity_mismatch_aborts_boot(self, *_):
         mock_co = self._MOCK_CO_JSON
@@ -1090,6 +1106,19 @@ class TestSnapshot(unittest.TestCase):
         self.assertLess(shutdown_idx, start_idx)
 
     @patch("time.sleep")
+    def test_snapshot_detects_etcd_image_with_yaml(self, _):
+        ssh = self._make_ssh_mock()
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "run_vm", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_snapshot(self._snapshot_args())
+
+        etcd_detect = next(c for c in self.calls if "etcd-pod.yaml" in c and "python3" in c)
+        self.assertIn("yaml.safe_load", etcd_detect,
+            "must use yaml.safe_load to parse etcd manifest (it's YAML, not JSON)")
+
+    @patch("time.sleep")
     def test_snapshot_prunes_container_images(self, _):
         ssh = self._make_ssh_mock()
         wrapped = self.mock_env.wrap_run_positional(ssh)
@@ -1102,7 +1131,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(len(prune_cmds), 1)
         cmd = prune_cmds[0]
         self.assertIn("xargs -r sudo crictl rm", cmd)
-        self.assertIn("crictl rmi --prune", cmd)
+        self.assertIn("crictl --timeout 120s rmi --prune", cmd)
         self.assertIn("podman image prune -a -f", cmd)
 
     @patch("time.sleep")
@@ -1114,7 +1143,7 @@ class TestSnapshot(unittest.TestCase):
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             ct.cmd_snapshot(self._snapshot_args())
 
-        prune_idx = next(i for i, c in enumerate(self.calls) if "crictl rmi --prune" in c)
+        prune_idx = next(i for i, c in enumerate(self.calls) if "crictl --timeout 120s rmi --prune" in c)
         shutdown_idx = next(i for i, c in enumerate(self.calls) if "virsh shutdown" in c)
         self.assertLess(prune_idx, shutdown_idx,
             "container image pruning must happen before VM shutdown")
@@ -1302,8 +1331,13 @@ class TestPush(unittest.TestCase):
         r.stderr = ""
         if "command -v" in cmd:
             r.returncode = 0
+        elif "wc -l" in cmd and "chunk" in cmd:
+            if "disk-0" in cmd:
+                r.stdout = "2"
+            else:
+                r.stdout = "1"
         elif "ls -1" in cmd and "sort" in cmd:
-            r.stdout = "disk-0.chunk.aa.gz\ndisk-0.chunk.ab.gz\ndisk-1.chunk.aa.gz\n"
+            r.stdout = "disk-0.chunk.aa.zst\ndisk-0.chunk.ab.zst\ndisk-1.chunk.aa.zst\n"
         return r
 
     def _mock_write_file(self, path, content):
@@ -1317,11 +1351,11 @@ class TestPush(unittest.TestCase):
                 ct.cmd_push(self._push_args(name="nonexistent"))
         self.assertIn("nonexistent", str(ctx.exception))
 
-    def test_push_prereq_missing_pigz(self):
+    def test_push_prereq_missing_zstd(self):
         def inner(cmd, check=True):
             self.calls.append(cmd)
             r = MagicMock()
-            r.returncode = 1 if "command -v pigz" in cmd else 0
+            r.returncode = 1 if "command -v zstd" in cmd else 0
             r.stdout = ""
             r.stderr = ""
             return r
@@ -1329,7 +1363,7 @@ class TestPush(unittest.TestCase):
         with patch.object(ct.env, "run", side_effect=wrapped):
             with self.assertRaises(SystemExit) as ctx:
                 ct.cmd_push(self._push_args())
-        self.assertIn("pigz", str(ctx.exception))
+        self.assertIn("zstd", str(ctx.exception))
 
     def test_push_prereq_missing_podman(self):
         def inner(cmd, check=True):
@@ -1353,20 +1387,11 @@ class TestPush(unittest.TestCase):
 
         manifest_path = next(p for p in self.written_files if "manifest.json" in p)
         manifest = json.loads(self.written_files[manifest_path])
-        expected = ct.build_manifest(
-            flavor_name="test-flavor",
-            metadata={
-                "source_cluster": "abc123",
-                "source_primary_subnet": 135,
-                "source_secondary_subnet": 153,
-                "memory_kib": 67108864,
-                "vcpus": 16,
-                "etcd_image": "quay.io/test/etcd:latest",
-                "created_at": "2026-01-01T00:00:00Z",
-            },
-            disk_names=["disk-0.qcow2", "disk-1.qcow2"],
-        )
-        self.assertEqual(manifest, expected)
+        self.assertEqual(manifest["flavor"], "test-flavor")
+        self.assertEqual(manifest["compression"], "zstd")
+        self.assertEqual(manifest["disks"][0]["chunk_count"], 2)
+        self.assertEqual(manifest["disks"][1]["chunk_count"], 1)
+        self.assertEqual(manifest["metadata"]["vcpus"], 16)
 
     def test_push_generates_dockerfile(self):
         wrapped = self.mock_env.wrap_run_positional(self._inner_mock_run)
@@ -1411,8 +1436,11 @@ class TestPush(unittest.TestCase):
             r.stderr = ""
             if "command -v" in cmd:
                 return r
+            if "wc -l" in cmd:
+                r.stdout = "1"
+                return r
             if "ls -1" in cmd and "sort" in cmd:
-                r.stdout = "disk-0.chunk.aa.gz\n"
+                r.stdout = "disk-0.chunk.aa.zst\n"
                 return r
             if "build" in cmd and "podman" in cmd:
                 raise SystemExit("build failed")
@@ -1433,6 +1461,30 @@ class TestPull(unittest.TestCase):
         self.mock_env.setup({"flavors": {}, "clones": {}, "next_subnet": 160})
         self.calls = []
 
+    _MANIFEST_DIGEST = "aaa111"
+    _CRYPTO_DIGEST = "bbb222"
+    _CHUNK_DIGEST = "ccc333"
+
+    _OCI_MANIFEST = json.dumps({
+        "layers": [
+            {"digest": f"sha256:{_MANIFEST_DIGEST}"},
+            {"digest": f"sha256:{_CRYPTO_DIGEST}"},
+            {"digest": f"sha256:{_CHUNK_DIGEST}"},
+        ]
+    })
+
+    def _build_ct_manifest(self):
+        m = ct.build_manifest(
+            flavor_name="test-pulled",
+            metadata={"source_cluster": "abc", "vcpus": 16, "memory_kib": 67108864,
+                       "source_primary_subnet": 135, "source_secondary_subnet": 153,
+                       "etcd_image": "quay.io/test/etcd", "created_at": "2026-01-01T00:00:00Z"},
+            disk_names=["disk-0.qcow2"],
+        )
+        m["compression"] = "zstd"
+        m["disks"][0]["chunk_count"] = 1
+        return m
+
     def _pull_args(self, image="quay.io/org/repo:tag", name=None):
         return argparse.Namespace(image=image, name=name)
 
@@ -1443,14 +1495,9 @@ class TestPull(unittest.TestCase):
         r.stdout = ""
         r.stderr = ""
         if "cat" in cmd and "manifest.json" in cmd:
-            manifest = ct.build_manifest(
-                flavor_name="test-pulled",
-                metadata={"source_cluster": "abc", "vcpus": 16, "memory_kib": 67108864,
-                           "source_primary_subnet": 135, "source_secondary_subnet": 153,
-                           "etcd_image": "quay.io/test/etcd", "created_at": "2026-01-01T00:00:00Z"},
-                disk_names=["disk-0.qcow2"],
-            )
-            r.stdout = json.dumps(manifest)
+            r.stdout = self._OCI_MANIFEST
+        elif "gzip -dc" in cmd and self._MANIFEST_DIGEST in cmd and "tar xf - -O" in cmd and "strip" not in cmd:
+            r.stdout = json.dumps(self._build_ct_manifest())
         return r
 
     def test_pull_prereq_missing_pigz(self):
@@ -1510,15 +1557,10 @@ class TestPull(unittest.TestCase):
             r.stdout = ""
             r.stderr = ""
             if "cat" in cmd and "manifest.json" in cmd:
-                manifest = ct.build_manifest(
-                    flavor_name="test-pulled",
-                    metadata={"source_cluster": "abc", "vcpus": 16, "memory_kib": 67108864,
-                               "source_primary_subnet": 135, "source_secondary_subnet": 153,
-                               "etcd_image": "quay.io/test/etcd", "created_at": "2026-01-01T00:00:00Z"},
-                    disk_names=["disk-0.qcow2"],
-                )
-                r.stdout = json.dumps(manifest)
-            if "pigz -d" in cmd:
+                r.stdout = self._OCI_MANIFEST
+            elif "gzip -dc" in cmd and self._MANIFEST_DIGEST in cmd and "tar xf - -O" in cmd and "strip" not in cmd:
+                r.stdout = json.dumps(self._build_ct_manifest())
+            if "set -o pipefail" in cmd:
                 raise RuntimeError("decompress failed")
             return r
 
@@ -1530,30 +1572,25 @@ class TestPull(unittest.TestCase):
 
         cleanup_rm = [c for c in fail_calls if "rm -rf" in c and "tmp-pull-" in c]
         self.assertTrue(len(cleanup_rm) > 0)
-        cleanup_container = [c for c in fail_calls if "rm" in c and "cluster-tool-pull-" in c]
-        self.assertTrue(len(cleanup_container) > 0)
-        cleanup_image = [c for c in fail_calls if "rmi" in c]
-        self.assertTrue(len(cleanup_image) > 0)
 
     def test_pull_decompresses_and_reassembles(self):
         wrapped = self.mock_env.wrap_run(self._inner_mock_run)
         with patch.object(ct.env, "run", side_effect=wrapped), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             ct.cmd_pull(self._pull_args())
-        pigz_cmds = [c for c in self.calls if "pigz -d" in c]
-        self.assertTrue(len(pigz_cmds) > 0)
-        cat_cmds = [c for c in self.calls if c.startswith("cat ") and ".chunk." in c]
-        self.assertEqual(len(cat_cmds), 1)
-        self.assertIn("disk-0.qcow2", cat_cmds[0])
+        reassemble_cmds = [c for c in self.calls if "set -o pipefail" in c and "disk-0.qcow2" in c]
+        self.assertEqual(len(reassemble_cmds), 1)
+        self.assertIn("zstd -d", reassemble_cmds[0])
+        self.assertIn("gzip -dc", reassemble_cmds[0])
 
     def test_pull_installs_crypto(self):
         wrapped = self.mock_env.wrap_run(self._inner_mock_run)
         with patch.object(ct.env, "run", side_effect=wrapped), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             ct.cmd_pull(self._pull_args())
-        cp_cmds = [c for c in self.calls if "cp -r" in c and "crypto" in c]
-        self.assertEqual(len(cp_cmds), 1)
-        self.assertIn(ct.flavor_crypto_dir("test-pulled"), cp_cmds[0])
+        crypto_cmds = [c for c in self.calls if "strip-components" in c and self._CRYPTO_DIGEST in c]
+        self.assertEqual(len(crypto_cmds), 1)
+        self.assertIn(ct.flavor_crypto_dir("test-pulled"), crypto_cmds[0])
 
 
 class TestSetupClient(unittest.TestCase):
