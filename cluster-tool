@@ -160,9 +160,9 @@ def _dnsmasq_dir():
 
 def _reload_dns():
     if sys.platform == "darwin":
-        subprocess.run(["sudo", "killall", "-HUP", "dnsmasq"], check=True)
+        subprocess.run(["sudo", "killall", "-HUP", "dnsmasq"], capture_output=True)
     else:
-        _reload_dns()
+        subprocess.run(["nmcli", "general", "reload"], check=True)
 
 
 def load_state():
