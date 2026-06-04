@@ -810,7 +810,8 @@ def cmd_boot(args):
             f"--cn-san-replace test-infra-cluster-{source_id}-master-0:{vm_name} "
             f"--cn-san-replace system:node:test-infra-cluster-{source_id}-master-0,system:node:{vm_name} "
             f"--cn-san-replace {src_ip}:{vm_ip} "
-            f"--cn-san-replace {src_sec_ip}:{new_sec_ip}",
+            f"--cn-san-replace {src_sec_ip}:{new_sec_ip} "
+            f"--extend-expiration",
             identity=key_path)
 
         env.run_vm(vm_ip, "sudo podman stop etcd-recert && sudo podman rm etcd-recert", identity=key_path)

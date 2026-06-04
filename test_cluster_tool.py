@@ -582,6 +582,7 @@ class TestTransactionalBoot(unittest.TestCase):
         self.assertIn("--cn-san-replace *.apps.test-infra-cluster-6ef80144.redhat.com:*.apps.test-infra-cluster-aabbccdd.redhat.com", recert_cmd)
         self.assertIn("--cn-san-replace test-infra-cluster-6ef80144-master-0:test-infra-cluster-aabbccdd-master-0", recert_cmd)
         self.assertIn("--cn-san-replace system:node:test-infra-cluster-6ef80144-master-0,system:node:test-infra-cluster-aabbccdd-master-0", recert_cmd)
+        self.assertIn("--extend-expiration", recert_cmd)
         kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
         kubeconfig.unlink(missing_ok=True)
 
