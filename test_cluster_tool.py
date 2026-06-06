@@ -349,6 +349,7 @@ class TestTransactionalBoot(unittest.TestCase):
 
     def _make_ssh_mock(self, fail_on):
         destroyed = set()
+        undefined = set()
         def ssh(cmd, check=True):
             self.calls.append((cmd, check))
             if fail_on in cmd and check:
@@ -360,12 +361,21 @@ class TestTransactionalBoot(unittest.TestCase):
             elif "virsh destroy " in cmd:
                 destroyed.add(cmd.split("virsh destroy ")[1])
                 r.stdout = ""
+            elif "virsh undefine " in cmd:
+                undefined.add(cmd.split("virsh undefine ")[1])
+                r.stdout = ""
             elif "virsh domstate " in cmd:
                 vm = cmd.split("virsh domstate ")[1]
-                r.stdout = "shut off" if vm in destroyed else "running"
+                if vm in undefined:
+                    r.returncode = 1
+                    r.stderr = "Domain not found"
+                elif vm in destroyed:
+                    r.stdout = "shut off"
+                else:
+                    r.stdout = "running"
             else:
                 r.stdout = ""
-            r.stderr = ""
+            r.stderr = getattr(r, 'stderr', "") or ""
             return r
         return ssh
 
