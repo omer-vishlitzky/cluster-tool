@@ -443,11 +443,15 @@ def destroy_vm(vm_name):
     r = env.run(f"virsh domstate {vm_name}", check=False)
     if r.returncode != 0:
         return
-    if "shut off" in r.stdout:
-        env.run(f"virsh undefine {vm_name}")
-        return
-    env.run(f"virsh destroy {vm_name}")
+    if "shut off" not in r.stdout:
+        env.run(f"virsh destroy {vm_name}")
     env.run(f"virsh undefine {vm_name}")
+    for _ in range(30):
+        r = env.run(f"virsh domstate {vm_name}", check=False)
+        if r.returncode != 0:
+            return
+        time.sleep(1)
+    print(f"WARNING: VM {vm_name} still present after 30s, proceeding anyway")
 
 
 def _strip_haproxy_clone(config, clone_id):
