@@ -1319,18 +1319,21 @@ def _setup_client():
 
     print("=== cluster-tool client setup ===")
 
-    print("[1/6] Installing dnsmasq...")
+    print("[1/7] Installing dnsmasq...")
     subprocess.run(["dnf", "install", "-y", "dnsmasq"], capture_output=True, check=True)
 
-    print("[2/6] Enabling dnsmasq in NetworkManager...")
+    print("[2/7] Disabling standalone dnsmasq service (NM manages its own)...")
+    subprocess.run(["systemctl", "disable", "--now", "dnsmasq"], capture_output=True)
+
+    print("[3/7] Enabling dnsmasq in NetworkManager...")
     Path("/etc/NetworkManager/conf.d").mkdir(parents=True, exist_ok=True)
     Path("/etc/NetworkManager/conf.d/cluster-tool-dns.conf").write_text("[main]\ndns=dnsmasq\n")
 
-    print("[3/6] Making dnsmasq config dir writable...")
+    print("[4/7] Making dnsmasq config dir writable...")
     DNSMASQ_DIR.mkdir(parents=True, exist_ok=True)
     subprocess.run(["chown", user, str(DNSMASQ_DIR)], check=True)
 
-    print("[4/6] Adding polkit rule for NetworkManager reload...")
+    print("[5/7] Adding polkit rule for NetworkManager reload...")
     Path("/etc/polkit-1/rules.d").mkdir(parents=True, exist_ok=True)
     Path("/etc/polkit-1/rules.d/50-cluster-tool-nm.rules").write_text(
         f'polkit.addRule(function(action, subject) {{\n'
@@ -1341,11 +1344,11 @@ def _setup_client():
         f'}});\n'
     )
 
-    print("[5/6] Stopping stale dnsmasq processes...")
+    print("[6/7] Stopping stale dnsmasq processes...")
     subprocess.run(["pkill", "-x", "dnsmasq"], capture_output=True)
     time.sleep(1)
 
-    print("[6/6] Restarting NetworkManager...")
+    print("[7/7] Restarting NetworkManager...")
     resolv = Path("/etc/resolv.conf")
     resolv.unlink(missing_ok=True)
     subprocess.run(["systemctl", "restart", "NetworkManager"], check=True)
