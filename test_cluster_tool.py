@@ -344,8 +344,8 @@ class TestTransactionalBoot(unittest.TestCase):
         self.mock_env.setup(self._INITIAL_STATE)
         self.calls = []
 
-    def _boot_args(self):
-        return argparse.Namespace(name="aabbccdd", flavor="default")
+    def _boot_args(self, no_rollback=False):
+        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=no_rollback)
 
     def _make_ssh_mock(self, fail_on):
         destroyed = set()
@@ -424,6 +424,19 @@ class TestTransactionalBoot(unittest.TestCase):
         self.assertTrue(any("net-destroy test-infra-secondary-network-aabbccdd" in c for c in cleanup))
         self.assertTrue(any("virsh destroy" in c for c in cleanup))
         self.assertEqual(self.mock_env.get_saved_state()["clones"], {})
+
+    @patch("time.sleep")
+    @patch.object(ct.ExecutionEnv, "write_file")
+    @patch.object(ct, "add_dns_entry")
+    @patch.object(ct.ExecutionEnv, "copy_from")
+    def test_no_rollback_preserves_clone(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_ssh_mock("podman run --rm --name recert"))
+        with patch.object(ct.env, "run", side_effect=ssh):
+            with self.assertRaises(SystemExit):
+                ct.cmd_boot(self._boot_args(no_rollback=True))
+
+        cleanup = self._cleanup_cmds()
+        self.assertEqual(cleanup, [], "no rollback commands should run with --no-rollback")
 
     @patch("time.sleep")
     @patch.object(ct.ExecutionEnv, "write_file")

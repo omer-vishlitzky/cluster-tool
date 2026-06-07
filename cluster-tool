@@ -947,22 +947,28 @@ def cmd_boot(args):
         print_step(9, total, "Verifying cluster identity", "done")
 
     except (SystemExit, subprocess.CalledProcessError) as e:
-        print(f"\nBoot failed, rolling back...")
-        for kind, target in reversed(cleanup):
-            if kind == "vm":
-                destroy_vm(target)
-            elif kind == "net":
-                env.run(f"virsh net-destroy {target}")
-                env.run(f"virsh net-undefine {target}")
-            elif kind == "rm":
-                env.run(f"rm -f {target}")
-            elif kind == "kubeconfig":
-                target.unlink(missing_ok=True)
-            elif kind == "haproxy":
-                remove_haproxy_clone(target)
-            elif kind == "dns":
-                remove_dns_entry(target)
-        print("Rollback complete.")
+        if args.no_rollback:
+            print(f"\nBoot failed. Clone preserved for debugging (--no-rollback).")
+            print(f"  VM: {vm_name}")
+            print(f"  SSH: ssh -o StrictHostKeyChecking=no -i {key_path} core@{vm_ip}")
+            print(f"  Destroy manually: cluster-tool destroy {clone_id}")
+        else:
+            print(f"\nBoot failed, rolling back...")
+            for kind, target in reversed(cleanup):
+                if kind == "vm":
+                    destroy_vm(target)
+                elif kind == "net":
+                    env.run(f"virsh net-destroy {target}")
+                    env.run(f"virsh net-undefine {target}")
+                elif kind == "rm":
+                    env.run(f"rm -f {target}")
+                elif kind == "kubeconfig":
+                    target.unlink(missing_ok=True)
+                elif kind == "haproxy":
+                    remove_haproxy_clone(target)
+                elif kind == "dns":
+                    remove_dns_entry(target)
+            print("Rollback complete.")
         if isinstance(e, subprocess.CalledProcessError):
             sys.exit(f"Command failed: {e.cmd}\n{e.stderr or e.stdout or ''}")
         raise
@@ -1472,6 +1478,7 @@ def main():
     boot_p = sub.add_parser("boot", help="Boot a fresh cluster from a snapshot flavor")
     boot_p.add_argument("--flavor", help="Flavor to boot from (default: most recent)")
     boot_p.add_argument("--name", help="Clone ID (random if omitted)")
+    boot_p.add_argument("--no-rollback", action="store_true", help="Preserve failed clone for debugging (don't rollback on failure)")
 
     list_p = sub.add_parser("list", help="Show running clones")
 
