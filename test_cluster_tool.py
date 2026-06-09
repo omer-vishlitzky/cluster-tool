@@ -1943,3 +1943,51 @@ class TestConfigLoading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResolveHostIP(unittest.TestCase):
+    """Test resolve_host_ip() for IPv6 link-local filtering"""
+
+    def test_ipv4_only(self):
+        """Should return IPv4 when only IPv4 available"""
+        mock_addrs = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.10', 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            result = ct.resolve_host_ip('example.com')
+            self.assertEqual(result, '192.168.1.10')
+
+    def test_ipv4_preferred_over_ipv6(self):
+        """Should prefer IPv4 over IPv6 when both available"""
+        mock_addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::1', 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.10', 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            result = ct.resolve_host_ip('example.com')
+            self.assertEqual(result, '192.168.1.10')
+
+    def test_filters_ipv6_link_local(self):
+        """Should filter out IPv6 link-local (fe80::) addresses"""
+        mock_addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('fe80::1', 0, 0, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::1', 0, 0, 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            result = ct.resolve_host_ip('example.com')
+            self.assertEqual(result, '2001:db8::1')
+
+    def test_global_ipv6_fallback(self):
+        """Should use global IPv6 when no IPv4"""
+        mock_addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::1', 0, 0, 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            result = ct.resolve_host_ip('example.com')
+            self.assertEqual(result, '2001:db8::1')
+
+    def test_hostname_not_found(self):
+        """Should exit with error when hostname not resolved"""
+        with patch('socket.getaddrinfo', side_effect=socket.gaierror("Not found")):
+            with self.assertRaises(SystemExit):
+                ct.resolve_host_ip('nonexistent.invalid')
