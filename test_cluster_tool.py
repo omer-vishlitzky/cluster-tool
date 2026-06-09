@@ -217,6 +217,29 @@ class TestTemplates(unittest.TestCase):
         self.assertIn("33554432", xml)
         self.assertIn("8</vcpu>", xml)
 
+    def test_vm_xml_custom_machine_and_emulator(self):
+        xml = ct.gen_vm_xml(
+            "a1b2c3d4", "/path/overlay.qcow2", "02:00:00:aa:bb:cc", "02:00:00:dd:ee:ff",
+            machine_type="pc-q35-4.0", emulator="/usr/sbin/qemu-kvm",
+        )
+        self.assertIn("machine='pc-q35-4.0'", xml)
+        self.assertIn("<emulator>/usr/sbin/qemu-kvm</emulator>", xml)
+
+    def test_parse_machine_types(self):
+        machine_help = (
+            "q35   Standard PC (Q35 + ICH9, 2009)\n"
+            "pc-q35-4.0   Standard PC (Q35 + ICH9, 2009)\n"
+        )
+        self.assertEqual(ct._parse_machine_types(machine_help), ["q35", "pc-q35-4.0"])
+
+    def test_detect_vm_machine_type_prefers_q35(self):
+        ct.env = MagicMock()
+        ct.env.run.return_value = MagicMock(
+            returncode=0,
+            stdout="pc-i440fx-2.1 legacy\nq35 Standard PC\npc-q35-4.0 Standard PC\n",
+        )
+        self.assertEqual(ct.detect_vm_machine_type("/usr/bin/qemu-system-x86_64"), "q35")
+
     def test_haproxy_additions(self):
         use_backends, backends = ct.gen_haproxy_additions("a1b2c3d4", 160)
         self.assertIn("api-a1b2c3d4", use_backends["api"])
