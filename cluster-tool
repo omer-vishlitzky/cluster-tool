@@ -67,6 +67,19 @@ def resolve_server(name):
         sys.exit(f"Server '{name}' not found. Run './cluster-tool connect {name} --host ...' first.")
     return config["servers"][name]["host"]
 
+
+def resolve_host_ip(hostname):
+    try:
+        addrs = socket.getaddrinfo(hostname, None)
+        # Filter out IPv6 link-local addresses (fe80::) as they need zone IDs
+        usable = [addr[4][0] for addr in addrs
+                  if not (addr[0] == socket.AF_INET6 and addr[4][0].startswith("fe80:"))]
+        # Prefer IPv4, fall back to usable IPv6
+        ipv4 = [ip for ip in usable if ":" not in ip]
+        return ipv4[0] if ipv4 else (usable[0] if usable else addrs[0][4][0])
+    except (socket.gaierror, IndexError):
+        sys.exit(f"Cannot resolve hostname '{hostname}' to a usable IP address.")
+
 SERVER_CONFIG_DIR = "~/.config/cluster-tool"
 SERVER_STATE_FILE = f"{SERVER_CONFIG_DIR}/state.json"
 SUBNET_START = 160
@@ -1433,10 +1446,7 @@ def cmd_connect(args):
     global env
     host = args.host
     hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
-    try:
-        host_ip = socket.getaddrinfo(hostname, None)[0][4][0]
-    except socket.gaierror:
-        sys.exit(f"Cannot resolve hostname '{hostname}'.")
+    host_ip = resolve_host_ip(hostname)
     env = ExecutionEnv(host=host, host_ip=host_ip)
     _setup_server(data_path=args.data_path)
     config = load_servers()
@@ -1553,10 +1563,7 @@ def main():
         host = resolve_server(server_name)
 
     hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
-    try:
-        host_ip = socket.getaddrinfo(hostname, None)[0][4][0]
-    except socket.gaierror:
-        sys.exit(f"Cannot resolve hostname '{hostname}'.")
+    host_ip = resolve_host_ip(hostname)
     env = ExecutionEnv(host=host, host_ip=host_ip)
 
     r = env.run("cat ~/.config/cluster-tool/config", check=False)
