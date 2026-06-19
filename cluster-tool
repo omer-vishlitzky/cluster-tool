@@ -309,6 +309,20 @@ def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
         </network>""")
 
 
+def _detect_machine_type():
+    """Detect the host's default i440fx machine type from QEMU."""
+    try:
+        r = subprocess.run(
+            ["/usr/libexec/qemu-kvm", "-machine", "help"],
+            capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            if "i440fx" in line.lower() and "(default)" in line.lower():
+                return line.split()[0]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "pc"
+
+
 def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=67108864, vcpus=16):
     if isinstance(overlay_disks, str):
         overlay_disks = [overlay_disks]
@@ -321,6 +335,7 @@ def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=6
             f"\n              <source file='{overlay}'/>"
             f"\n              <target dev='{dev}' bus='scsi'/>"
             f"\n            </disk>")
+    machine_type = _detect_machine_type()
     return textwrap.dedent(f"""\
         <domain type='kvm'>
           <name>test-infra-cluster-{clone_id}-master-0</name>
@@ -328,7 +343,7 @@ def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=6
           <currentMemory unit='KiB'>{memory_kib}</currentMemory>
           <vcpu placement='static'>{vcpus}</vcpu>
           <os>
-            <type arch='x86_64' machine='pc-i440fx-rhel7.6.0'>hvm</type>
+            <type arch='x86_64' machine='{machine_type}'>hvm</type>
             <boot dev='hd'/>
           </os>
           <features><acpi/><apic/><pae/></features>
