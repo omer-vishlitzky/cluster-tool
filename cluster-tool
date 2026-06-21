@@ -1230,8 +1230,17 @@ def cmd_pull(args):
 
     try:
         print_step(1, total, "Downloading from registry")
-        env.run(f"mkdir -p {tmp}/oci")
-        env.run(f"skopeo copy docker://{image_ref} dir:{tmp}/oci")
+        max_attempts = 10
+        for attempt in range(1, max_attempts + 1):
+            env.run(f"rm -rf {tmp}/oci")
+            env.run(f"mkdir -p {tmp}/oci")
+            r = env.run(f"skopeo copy docker://{image_ref} dir:{tmp}/oci", check=False)
+            if r.returncode == 0:
+                break
+            if attempt == max_attempts:
+                sys.exit(f"Pull failed after {max_attempts} attempts: {r.stderr.strip()}")
+            print(f"  Pull attempt {attempt}/{max_attempts} failed, retrying in 60s...")
+            time.sleep(60)
         print_step(1, total, "Downloading from registry", "done")
 
         print_step(2, total, "Reading manifest")
