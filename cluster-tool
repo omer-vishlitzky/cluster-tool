@@ -191,9 +191,20 @@ def generate_clone_id():
 
 
 def allocate_subnet(state):
-    subnet = state["next_subnet"]
-    state["next_subnet"] = subnet + 1
-    return subnet
+    reserved = set()
+    for fl in state["flavors"].values():
+        reserved.add(fl["source_primary_subnet"])
+        reserved.add(fl.get("source_secondary_subnet", fl["source_primary_subnet"] + SUBNET_SECONDARY_OFFSET))
+    for cl in state["clones"].values():
+        reserved.add(cl["subnet_primary"])
+        reserved.add(cl.get("subnet_secondary", cl["subnet_primary"] + SUBNET_SECONDARY_OFFSET))
+
+    for candidate in range(SUBNET_START, 256 - SUBNET_SECONDARY_OFFSET):
+        secondary = candidate + SUBNET_SECONDARY_OFFSET
+        if candidate not in reserved and secondary not in reserved:
+            return candidate
+
+    sys.exit("No available subnets. Destroy unused clones to free up address space.")
 
 
 def generate_mac():

@@ -126,13 +126,52 @@ class TestStateManagement(unittest.TestCase):
         loaded = ct.load_state()
         self.assertEqual(loaded, state)
 
-    def test_allocate_subnet_increments(self):
+    def test_allocate_subnet_returns_first_free(self):
         state = ct.load_state()
         s1 = ct.allocate_subnet(state)
-        s2 = ct.allocate_subnet(state)
         self.assertEqual(s1, 160)
-        self.assertEqual(s2, 161)
-        self.assertEqual(state["next_subnet"], 162)
+
+    def test_allocate_subnet_skips_reserved(self):
+        state = {
+            "flavors": {"f1": {"source_primary_subnet": 160, "source_secondary_subnet": 178}},
+            "clones": {},
+            "next_subnet": 160,
+        }
+        s1 = ct.allocate_subnet(state)
+        # 160 and 178 are reserved by flavor, so 160 is skipped.
+        # candidate 161: secondary=179, both free -> should return 161
+        self.assertEqual(s1, 161)
+
+    def test_allocate_subnet_skips_clone_subnets(self):
+        state = {
+            "flavors": {},
+            "clones": {"c1": {"subnet_primary": 160, "subnet_secondary": 178}},
+            "next_subnet": 160,
+        }
+        s1 = ct.allocate_subnet(state)
+        self.assertEqual(s1, 161)
+
+    def test_allocate_subnet_recycles_after_destroy(self):
+        state = {
+            "flavors": {},
+            "clones": {"c2": {"subnet_primary": 161, "subnet_secondary": 179}},
+            "next_subnet": 162,
+        }
+        # Clone at 160 was destroyed, so 160 should be available again
+        s1 = ct.allocate_subnet(state)
+        self.assertEqual(s1, 160)
+
+    def test_allocate_subnet_exhausted(self):
+        state = {"flavors": {}, "clones": {}, "next_subnet": 160}
+        # Fill all possible slots
+        for i in range(ct.SUBNET_START, 256 - ct.SUBNET_SECONDARY_OFFSET):
+            state["clones"][f"c{i}"] = {
+                "subnet_primary": i,
+                "subnet_secondary": i + ct.SUBNET_SECONDARY_OFFSET,
+            }
+        with self.assertRaises(SystemExit) as ctx:
+            ct.allocate_subnet(state)
+        self.assertIn("No available subnets", str(ctx.exception))
 
 
 class TestIDGeneration(unittest.TestCase):
@@ -1250,6 +1289,7 @@ class TestLocking(unittest.TestCase):
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             with ct.locked_state() as state:
                 s1 = ct.allocate_subnet(state)
+                state["clones"]["c1"] = {"subnet_primary": s1, "subnet_secondary": s1 + ct.SUBNET_SECONDARY_OFFSET}
             with ct.locked_state() as state:
                 s2 = ct.allocate_subnet(state)
         self.assertEqual(s1, 160)
