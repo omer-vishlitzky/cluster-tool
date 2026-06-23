@@ -43,6 +43,41 @@ Single Python 3 file, stdlib only, no installation needed.
 
 Everything else (libvirt, qemu-kvm, podman, pigz, haproxy) is installed automatically by `connect`.
 
+## Minimum Resource Requirements
+
+Each clone boots a full OpenShift SNO virtual machine. Plan your server hardware accordingly.
+
+### Per-Clone VM Defaults
+
+| Resource | Default | Notes |
+|----------|---------|-------|
+| RAM | 64 GB | Set by the flavor at snapshot time |
+| vCPUs | 16 | Set by the flavor at snapshot time |
+
+### Server Sizing
+
+| Component | Minimum (1 clone) | Recommended (3 clones) |
+|-----------|--------------------|------------------------|
+| RAM | 72 GB | 200 GB |
+| CPU cores | 20 | 52 |
+| Disk | 200 GB | 400 GB |
+
+**Disk breakdown:**
+- ~100 GB per flavor (golden qcow2 disk images, 60–90 GB each plus metadata)
+- Overlays per clone are small (copy-on-write, only stores diffs)
+- Reserve space for container storage (podman image cache, etcd/recert images)
+
+### Network
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 6443 | TCP | Kubernetes API (HAProxy SNI routing) |
+| 443 | TCP | Ingress HTTPS (HAProxy SNI routing) |
+| 80 | TCP | Ingress HTTP |
+
+- Each clone allocates two `/24` subnets from the `192.168.x.0` range (primary + secondary at offset +18)
+- Maximum ~90 clones per server before subnet exhaustion
+
 ## Where Does It Run?
 
 cluster-tool runs on your **laptop** and connects to **baremetal servers** (beakers) via SSH. Your laptop is the control plane — it sends commands to the server where VMs actually run.
