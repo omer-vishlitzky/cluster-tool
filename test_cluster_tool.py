@@ -354,12 +354,13 @@ class TestTemplates(unittest.TestCase):
         self.assertEqual(ct._parse_machine_types(machine_help), ["q35", "pc-q35-4.0"])
 
     def test_detect_vm_machine_type_prefers_q35(self):
-        ct.env = MagicMock()
-        ct.env.run.return_value = MagicMock(
+        mock_env = MagicMock()
+        mock_env.run.return_value = MagicMock(
             returncode=0,
             stdout="pc-i440fx-2.1 legacy\nq35 Standard PC\npc-q35-4.0 Standard PC\n",
         )
-        self.assertEqual(ct.detect_vm_machine_type("/usr/bin/qemu-system-x86_64"), "q35")
+        with patch.object(ct, "env", mock_env):
+            self.assertEqual(ct.detect_vm_machine_type("/usr/bin/qemu-system-x86_64"), "q35")
 
     def test_haproxy_additions(self):
         use_backends, backends = ct.gen_haproxy_additions("a1b2c3d4", 160)
@@ -516,6 +517,10 @@ class TestTransactionalBoot(unittest.TestCase):
                     r.stdout = "shut off"
                 else:
                     r.stdout = "running"
+            elif "bash -c" in cmd and "test -x" in cmd:
+                r.stdout = "/usr/bin/qemu-system-x86_64\n"
+            elif "-machine help" in cmd:
+                r.stdout = "q35 Standard PC (Q35 + ICH9, 2009)\n"
             else:
                 r.stdout = ""
             r.stderr = getattr(r, 'stderr', "") or ""
@@ -641,6 +646,10 @@ class TestTransactionalBoot(unittest.TestCase):
                 r.stdout = mock_co
             elif "get nodes -o json" in cmd:
                 r.stdout = mock_nodes
+            elif "bash -c" in cmd and "test -x" in cmd:
+                r.stdout = "/usr/bin/qemu-system-x86_64\n"
+            elif "-machine help" in cmd:
+                r.stdout = "q35 Standard PC (Q35 + ICH9, 2009)\n"
             else:
                 r.stdout = "ok"
             r.stderr = ""
@@ -2246,6 +2255,115 @@ class TestResolveHostIP(unittest.TestCase):
         self.assertIn('resolve_host_ip', src_main)
 
 
+class TestDetectVmEmulator(unittest.TestCase):
+    def _make_mock_env(self, stdout="", returncode=0):
+        mock_env = MagicMock()
+        mock_env.run.return_value = MagicMock(returncode=returncode, stdout=stdout, stderr="")
+        return mock_env
+
+    def test_finds_first_candidate(self):
+        mock_env = self._make_mock_env(stdout="/usr/bin/qemu-system-x86_64\n", returncode=0)
+        with patch.object(ct, "env", mock_env):
+            result = ct.detect_vm_emulator()
+        self.assertEqual(result, "/usr/bin/qemu-system-x86_64")
+
+    def test_skips_missing_candidates_finds_fourth(self):
+        mock_env = self._make_mock_env(stdout="/usr/bin/qemu-kvm\n", returncode=0)
+        with patch.object(ct, "env", mock_env):
+            result = ct.detect_vm_emulator()
+        self.assertEqual(result, "/usr/bin/qemu-kvm")
+
+    def test_falls_back_to_command_v(self):
+        mock_env = self._make_mock_env(stdout="/usr/local/bin/qemu-system-x86_64\n", returncode=0)
+        with patch.object(ct, "env", mock_env):
+            result = ct.detect_vm_emulator()
+        self.assertEqual(result, "/usr/local/bin/qemu-system-x86_64")
+
+    def test_no_qemu_exits(self):
+        mock_env = self._make_mock_env(stdout="", returncode=1)
+        with patch.object(ct, "env", mock_env):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.detect_vm_emulator()
+        self.assertIn("No QEMU emulator found", str(ctx.exception))
+
+    def test_single_ssh_command(self):
+        mock_env = self._make_mock_env(stdout="/usr/bin/qemu-system-x86_64\n", returncode=0)
+        with patch.object(ct, "env", mock_env):
+            ct.detect_vm_emulator()
+        self.assertEqual(mock_env.run.call_count, 1)
+
+
+class TestDetectVmMachineType(unittest.TestCase):
+    def test_prefers_q35(self):
+        mock_env = MagicMock()
+        mock_env.run.return_value = MagicMock(
+            returncode=0,
+            stdout="pc-i440fx-2.1 legacy\nq35 Standard PC\npc-q35-4.0 Standard PC\n",
+        )
+        with patch.object(ct, "env", mock_env):
+            self.assertEqual(ct.detect_vm_machine_type("/usr/bin/qemu-system-x86_64"), "q35")
+
+    def test_falls_back_to_i440fx_prefix(self):
+        mock_env = MagicMock()
+        mock_env.run.return_value = MagicMock(
+            returncode=0,
+            stdout="pc-i440fx-2.1 Standard PC (i440FX + PIIX, 1996)\n",
+        )
+        with patch.object(ct, "env", mock_env):
+            result = ct.detect_vm_machine_type("/usr/bin/qemu-system-x86_64")
+        self.assertEqual(result, "pc-i440fx-2.1")
+
+    def test_uses_first_available_when_no_preference(self):
+        mock_env = MagicMock()
+        mock_env.run.return_value = MagicMock(
+            returncode=0,
+            stdout="custom-machine-v1 Custom machine type\nanother-machine Custom\n",
+        )
+        with patch.object(ct, "env", mock_env):
+            result = ct.detect_vm_machine_type("/usr/bin/qemu-system-x86_64")
+        self.assertEqual(result, "custom-machine-v1")
+
+    def test_qemu_fails_exits(self):
+        mock_env = MagicMock()
+        mock_env.run.return_value = MagicMock(returncode=1, stdout="", stderr="command not found")
+        with patch.object(ct, "env", mock_env):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.detect_vm_machine_type("/usr/bin/qemu-system-x86_64")
+        self.assertIn("Failed to query machine types", str(ctx.exception))
+
+    def test_empty_output_exits(self):
+        mock_env = MagicMock()
+        mock_env.run.return_value = MagicMock(returncode=0, stdout="\n", stderr="")
+        with patch.object(ct, "env", mock_env):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.detect_vm_machine_type("/usr/bin/qemu-system-x86_64")
+        self.assertIn("No machine types found", str(ctx.exception))
+
+
+class TestResolveVmPlatform(unittest.TestCase):
+    def test_integration(self):
+        mock_env = MagicMock()
+        mock_env.run.side_effect = [
+            MagicMock(returncode=0, stdout="/usr/bin/qemu-system-x86_64\n", stderr=""),
+            MagicMock(returncode=0, stdout="q35 Standard PC\npc-i440fx-2.1 legacy\n", stderr=""),
+        ]
+        with patch.object(ct, "env", mock_env):
+            emulator, machine_type = ct.resolve_vm_platform()
+        self.assertEqual(emulator, "/usr/bin/qemu-system-x86_64")
+        self.assertEqual(machine_type, "q35")
+
+
+class TestGenVmXmlPlatformParams(unittest.TestCase):
+    def test_custom_emulator_and_machine(self):
+        xml = ct.gen_vm_xml(
+            "a1b2c3d4", "/path/overlay.qcow2",
+            "02:00:00:aa:bb:cc", "02:00:00:dd:ee:ff",
+            machine_type="pc-i440fx-2.1", emulator="/usr/libexec/qemu-kvm",
+        )
+        self.assertIn("machine='pc-i440fx-2.1'", xml)
+        self.assertIn("<emulator>/usr/libexec/qemu-kvm</emulator>", xml)
+        self.assertNotIn(ct.DEFAULT_VM_EMULATOR, xml)
+        self.assertNotIn(ct.DEFAULT_VM_MACHINE_TYPE, xml)
 if __name__ == "__main__":
     unittest.main()
 

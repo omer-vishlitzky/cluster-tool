@@ -324,18 +324,13 @@ def gen_primary_network_xml(clone_id, subnet, mac):
         </network>""")
 
 def detect_vm_emulator():
-    for candidate in VM_EMULATOR_CANDIDATES:
-        if env.run(f"test -x {shlex.quote(candidate)}", check=False).returncode == 0:
-            return candidate
-
-    for binary in ("qemu-system-x86_64", "qemu-kvm"):
-        r = env.run(f"command -v {binary}", check=False)
-        if r.returncode == 0:
-            resolved = r.stdout.strip().splitlines()
-            if resolved:
-                return resolved[0]
-
-    return DEFAULT_VM_EMULATOR
+    candidates = " ".join(shlex.quote(c) for c in VM_EMULATOR_CANDIDATES)
+    script = f"for p in {candidates}; do test -x $p && echo $p && exit 0; done; command -v qemu-system-x86_64 2>/dev/null || command -v qemu-kvm 2>/dev/null"
+    r = env.run(f"bash -c '{script}'", check=False)
+    path = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
+    if not path:
+        sys.exit("No QEMU emulator found on the target host. Install qemu-kvm or qemu-system-x86_64.")
+    return path
 
 
 def _parse_machine_types(machine_help):
@@ -351,7 +346,7 @@ def _parse_machine_types(machine_help):
 def detect_vm_machine_type(emulator):
     r = env.run(f"{shlex.quote(emulator)} -machine help", check=False)
     if r.returncode != 0:
-        return DEFAULT_VM_MACHINE_TYPE
+        sys.exit(f"Failed to query machine types from {emulator}. Is QEMU installed correctly?")
 
     machine_types = _parse_machine_types(r.stdout)
     machine_set = set(machine_types)
@@ -365,7 +360,10 @@ def detect_vm_machine_type(emulator):
             if machine.startswith(prefix):
                 return machine
 
-    return DEFAULT_VM_MACHINE_TYPE
+    if machine_types:
+        return machine_types[0]
+
+    sys.exit(f"No machine types found in {emulator} -machine help output.")
 
 
 def resolve_vm_platform():
