@@ -204,6 +204,7 @@ For CI, use `local` as the host when running directly on the baremetal machine:
 | `use NAME` | Set the default server. |
 | `snapshot --name NAME --source ID` | Create a snapshot flavor from a running cluster. Flattens disks, extracts crypto keys, injects SSH key. The private key is stored in the flavor's `crypto/` dir and travels with push/pull. |
 | `boot --flavor NAME [--name ID] [--server S]` | Boot a fresh clone. Creates overlays, networks, runs recert, waits for operators. If `--name` is omitted, a random 8-character hex ID is generated. |
+| `configure-access ID [--server S]` | Configure HAProxy and DNS for a clone. Requires sudo. Use when boot ran without sudo and skipped access configuration. |
 | `list [--server S]` | Show running clones. |
 | `flavors [--delete NAME] [--server S]` | List or delete flavors. |
 | `verify ID [--server S]` | Deploys a test pod that checks cluster DNS, external DNS resolution, and API access via service account. Reports PASS/FAIL per check. |
@@ -255,6 +256,35 @@ Measured timings (SNO with CNV+LVMS, 90 GB disk):
 5. Auto-detects storage (largest partition) or uses `--data-path`, since baremetal machines have different disk layouts and the root filesystem is often too small for 60-90 GB disk images
 6. Writes server config (idempotent — never overwrites existing config)
 7. Registers the server alias on the client
+
+**Note on permissions:** cluster-tool uses `sudo` internally for operations that require elevated privileges (HAProxy and DNS configuration). You'll be prompted for your password when needed. The user must be in the `libvirt` group for virsh/qemu operations.
+
+## Permission Requirements
+
+**On the server:**
+1. User is in the `libvirt` group: `sudo usermod -aG libvirt $USER` (log out and back in)
+2. Required packages installed (libvirt, qemu-kvm, podman, pigz, haproxy, skopeo, zstd)
+3. Services running (libvirtd, haproxy)
+4. User has sudo privileges (will be prompted for password when configuring HAProxy/DNS)
+
+**On the client (laptop):**
+- Run `./cluster-tool setup client` once for DNS configuration (will prompt for sudo password)
+
+### Usage:
+
+```bash
+# Boot a cluster (sudo password prompted for HAProxy/DNS config)
+./cluster-tool boot --flavor my-flavor --name test
+
+# If you skip sudo when prompted, configure access later
+./cluster-tool configure-access test
+
+# Or access the cluster directly via VM IP (no HAProxy/DNS needed)
+ssh -i /path/to/flavor/crypto/cluster-tool.key core@192.168.X.10 \
+  "sudo oc --kubeconfig=/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig get nodes"
+```
+
+The tool handles sudo prompts automatically - you just run the commands normally and enter your password when prompted.
 
 ## What Happens During Boot
 

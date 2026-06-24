@@ -36,6 +36,11 @@ def podman(subcmd):
             f"podman --root {PODMAN_ROOT} {subcmd}")
 
 
+def virsh_cmd(subcmd):
+    """Run virsh with system connection to enable network bridge creation."""
+    return f"virsh -c qemu:///system {subcmd}"
+
+
 def flavor_dir(name):
     return f"{REMOTE_FLAVORS}/{name}"
 
@@ -226,7 +231,7 @@ def parse_disk_paths(dumpxml_output, pool_name):
         if source.get("file"):
             path = source.get("file")
         elif source.get("pool") and source.get("volume"):
-            r = env.run(f"virsh vol-path --pool {source.get('pool')} {source.get('volume')}")
+            r = env.run(virsh_cmd(f"vol-path --pool {source.get('pool')} {source.get('volume')}"))
             path = r.stdout.strip()
         if path:
             disks.append({"target": target.get("dev"), "path": path})
@@ -440,14 +445,14 @@ def print_step(num, total, desc, status=""):
 
 
 def destroy_vm(vm_name):
-    r = env.run(f"virsh domstate {vm_name}", check=False)
+    r = env.run(virsh_cmd(f"domstate {vm_name}"), check=False)
     if r.returncode != 0:
         return
     if "shut off" not in r.stdout:
-        env.run(f"virsh destroy {vm_name}")
-    env.run(f"virsh undefine {vm_name}")
+        env.run(virsh_cmd(f"destroy {vm_name}"))
+    env.run(virsh_cmd(f"undefine {vm_name}"))
     for _ in range(30):
-        r = env.run(f"virsh domstate {vm_name}", check=False)
+        r = env.run(virsh_cmd(f"domstate {vm_name}"), check=False)
         if r.returncode != 0:
             return
         time.sleep(1)
@@ -483,7 +488,7 @@ def _strip_haproxy_clone(config, clone_id):
 def add_haproxy_clone(clone_id, subnet):
     with locked_haproxy():
         use_backends, backends = gen_haproxy_additions(clone_id, subnet)
-        result = env.run("cat /etc/haproxy/haproxy.cfg")
+        result = env.run("sudo cat /etc/haproxy/haproxy.cfg")
         config = _strip_haproxy_clone(result.stdout, clone_id)
 
         for key in ["api", "ingress-https", "ingress-http"]:
@@ -491,28 +496,41 @@ def add_haproxy_clone(clone_id, subnet):
             config = config.replace(marker, f"{use_backends[key]}\n\n{marker}", 1)
 
         config = config.rstrip() + "\n" + backends
-        env.write_file("/etc/haproxy/haproxy.cfg", config)
-        env.run("systemctl reload haproxy")
+        # Write to temp file first, then move with sudo
+        temp_cfg = "/tmp/haproxy-cluster-tool.cfg"
+        env.write_file(temp_cfg, config)
+        env.run(f"sudo mv {temp_cfg} /etc/haproxy/haproxy.cfg")
+        env.run(f"sudo chmod 644 /etc/haproxy/haproxy.cfg")
+        env.run("sudo systemctl reload haproxy")
 
 
 def remove_haproxy_clone(clone_id):
     with locked_haproxy():
-        result = env.run("cat /etc/haproxy/haproxy.cfg")
+        result = env.run("sudo cat /etc/haproxy/haproxy.cfg")
         config = _strip_haproxy_clone(result.stdout, clone_id)
-        env.write_file("/etc/haproxy/haproxy.cfg", config)
-        env.run("systemctl reload haproxy")
+        # Write to temp file first, then move with sudo
+        temp_cfg = "/tmp/haproxy-cluster-tool.cfg"
+        env.write_file(temp_cfg, config)
+        env.run(f"sudo mv {temp_cfg} /etc/haproxy/haproxy.cfg")
+        env.run(f"sudo chmod 644 /etc/haproxy/haproxy.cfg")
+        env.run("sudo systemctl reload haproxy")
 
 
 def add_dns_entry(clone_id):
     conf = DNSMASQ_DIR / f"cluster-{clone_id}.conf"
-    conf.write_text(gen_dnsmasq_conf(clone_id))
-    subprocess.run(["nmcli", "general", "reload"], check=True)
+    content = gen_dnsmasq_conf(clone_id)
+    # Write to temp file first, then move with sudo
+    temp_file = Path(f"/tmp/cluster-{clone_id}.conf")
+    temp_file.write_text(content)
+    subprocess.run(["sudo", "mv", str(temp_file), str(conf)], check=True)
+    subprocess.run(["sudo", "chmod", "644", str(conf)], check=True)
+    subprocess.run(["sudo", "nmcli", "general", "reload"], check=True)
 
 
 def remove_dns_entry(clone_id):
     conf = DNSMASQ_DIR / f"cluster-{clone_id}.conf"
-    conf.unlink(missing_ok=True)
-    subprocess.run(["nmcli", "general", "reload"], check=True)
+    subprocess.run(["sudo", "rm", "-f", str(conf)], check=True)
+    subprocess.run(["sudo", "nmcli", "general", "reload"], check=True)
 
 
 def verify_cluster_identity(vm_ip, expected_id, expected_domain, *, identity=None):
@@ -543,20 +561,20 @@ def cmd_snapshot(args):
     fdir = flavor_dir(flavor_name)
     crypto = flavor_crypto_dir(flavor_name)
 
-    r = env.run(f"virsh dominfo {vm_name}")
+    r = env.run(virsh_cmd(f"dominfo {vm_name}"))
     dominfo = parse_dominfo(r.stdout)
 
-    r = env.run(f"virsh dumpxml {vm_name}")
+    r = env.run(virsh_cmd(f"dumpxml {vm_name}"))
     disks = parse_disk_paths(r.stdout, f"test-infra-cluster-{source_id}")
 
-    r = env.run(f"virsh net-dumpxml test-infra-net-{source_id}")
+    r = env.run(virsh_cmd(f"net-dumpxml test-infra-net-{source_id}"))
     src_primary_subnet = parse_subnet(r.stdout)
-    r = env.run(f"virsh net-dumpxml test-infra-secondary-network-{source_id}")
+    r = env.run(virsh_cmd(f"net-dumpxml test-infra-secondary-network-{source_id}"))
     src_secondary_subnet = parse_subnet(r.stdout)
 
     vm_ip = f"192.168.{src_primary_subnet}.{VM_IP_SUFFIX}"
 
-    r = env.run(f"virsh domstate {vm_name}")
+    r = env.run(virsh_cmd(f"domstate {vm_name}"))
     vm_state = r.stdout.strip()
     if vm_state != "running":
         sys.exit(f"Source VM '{vm_name}' is '{vm_state}', expected 'running'")
@@ -626,9 +644,9 @@ def cmd_snapshot(args):
     print_step(6, 10, "Pruning unused container images", "done")
 
     print_step(7, 10, "Shutting down VM")
-    env.run(f"virsh shutdown {vm_name}")
+    env.run(virsh_cmd(f"shutdown {vm_name}"))
     for _ in range(150):
-        r = env.run(f"virsh domstate {vm_name}")
+        r = env.run(virsh_cmd(f"domstate {vm_name}"))
         if "shut off" in r.stdout:
             break
         time.sleep(2)
@@ -644,11 +662,11 @@ def cmd_snapshot(args):
     for i, disk in enumerate(disks):
         dest = f"{fdir}/disk-{i}.qcow2"
         env.run(f"qemu-img convert -O qcow2 {disk['path']} {dest}")
-        env.run(f"chown qemu:qemu {dest}")
+        env.run(f"chown qemu:qemu {dest}", check=False)
     print_step(9, 10, f"Copying {len(disks)} disk(s)", "done")
 
     print_step(10, 10, "Restarting source VM")
-    env.run(f"virsh start {vm_name}")
+    env.run(virsh_cmd(f"start {vm_name}"))
     print_step(10, 10, "Restarting source VM", "done")
 
     with locked_state() as state:
@@ -712,7 +730,9 @@ def cmd_boot(args):
         for disk_name in disk_names:
             overlay = f"{REMOTE_OVERLAYS}/{clone_id}-{disk_name}"
             env.run(f"qemu-img create -f qcow2 -b {fdir}/{disk_name} -F qcow2 {overlay}")
-            env.run(f"chown qemu:qemu {overlay}")
+            # Try to chown to qemu:qemu, but don't fail if we lack permissions
+            # (e.g., when user is in libvirt group but not running as root)
+            env.run(f"chown qemu:qemu {overlay}", check=False)
             cleanup.append(("rm", overlay))
             overlays.append(overlay)
         print_step(1, total, f"Creating {len(disk_names)} disk overlay(s)", "done")
@@ -721,21 +741,21 @@ def cmd_boot(args):
         primary_xml = gen_primary_network_xml(clone_id, subnet, mac1)
         secondary_xml = gen_secondary_network_xml(clone_id, subnet, subnet_sec, mac2)
         env.write_file(f"/tmp/net-{clone_id}.xml", primary_xml)
-        env.run(f"virsh net-define /tmp/net-{clone_id}.xml")
+        env.run(virsh_cmd(f"net-define /tmp/net-{clone_id}.xml"))
         cleanup.append(("net", f"test-infra-net-{clone_id}"))
-        env.run(f"virsh net-start test-infra-net-{clone_id}")
+        env.run(virsh_cmd(f"net-start test-infra-net-{clone_id}"))
         env.write_file(f"/tmp/snet-{clone_id}.xml", secondary_xml)
-        env.run(f"virsh net-define /tmp/snet-{clone_id}.xml")
+        env.run(virsh_cmd(f"net-define /tmp/snet-{clone_id}.xml"))
         cleanup.append(("net", f"test-infra-secondary-network-{clone_id}"))
-        env.run(f"virsh net-start test-infra-secondary-network-{clone_id}")
+        env.run(virsh_cmd(f"net-start test-infra-secondary-network-{clone_id}"))
         env.run(f"rm -f /tmp/net-{clone_id}.xml /tmp/snet-{clone_id}.xml")
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24", "done")
 
         print_step(3, total, "Booting VM")
         vm_xml = gen_vm_xml(clone_id, overlays, mac1, mac2, memory_kib=memory_kib, vcpus=vcpus)
         env.write_file(f"/tmp/vm-{clone_id}.xml", vm_xml)
-        env.run(f"virsh define /tmp/vm-{clone_id}.xml")
-        env.run(f"virsh start {vm_name}")
+        env.run(virsh_cmd(f"define /tmp/vm-{clone_id}.xml"))
+        env.run(virsh_cmd(f"start {vm_name}"))
         cleanup.append(("vm", vm_name))
         env.run(f"rm -f /tmp/vm-{clone_id}.xml")
         print_step(3, total, "Booting VM", "done")
@@ -872,10 +892,31 @@ def cmd_boot(args):
         kubeconfig_path.write_text(kc_content)
         cleanup.append(("kubeconfig", kubeconfig_path))
 
-        add_haproxy_clone(clone_id, subnet)
-        cleanup.append(("haproxy", clone_id))
-        add_dns_entry(clone_id)
-        cleanup.append(("dns", clone_id))
+        # HAProxy and DNS config now use sudo internally
+        haproxy_configured = False
+        dns_configured = False
+        try:
+            add_haproxy_clone(clone_id, subnet)
+            cleanup.append(("haproxy", clone_id))
+            haproxy_configured = True
+        except subprocess.CalledProcessError as e:
+            if "sudo" in str(e.cmd) or "sudo" in str(e):
+                print(f"  WARNING: HAProxy configuration requires sudo (prompt may have appeared above).")
+                print(f"           You can configure later: ./cluster-tool configure-access {clone_id}")
+            else:
+                raise
+
+        try:
+            add_dns_entry(clone_id)
+            cleanup.append(("dns", clone_id))
+            dns_configured = True
+        except subprocess.CalledProcessError as e:
+            if "sudo" in str(e.cmd) or "sudo" in str(e):
+                print(f"  WARNING: DNS configuration requires sudo (prompt may have appeared above).")
+                print(f"           You can configure later: ./cluster-tool configure-access {clone_id}")
+            else:
+                raise
+
         print_step(7, total, "Configuring access", "done")
 
         print_step(8, total, "Waiting for operators")
@@ -962,16 +1003,23 @@ def cmd_boot(args):
                 if kind == "vm":
                     destroy_vm(target)
                 elif kind == "net":
-                    env.run(f"virsh net-destroy {target}")
-                    env.run(f"virsh net-undefine {target}")
+                    # Try to destroy (stop) the network, but it may not be running
+                    env.run(virsh_cmd(f"net-destroy {target}"), check=False)
+                    env.run(virsh_cmd(f"net-undefine {target}"), check=False)
                 elif kind == "rm":
                     env.run(f"rm -f {target}")
                 elif kind == "kubeconfig":
                     target.unlink(missing_ok=True)
                 elif kind == "haproxy":
-                    remove_haproxy_clone(target)
+                    try:
+                        remove_haproxy_clone(target)
+                    except subprocess.CalledProcessError:
+                        pass  # Cleanup is best-effort
                 elif kind == "dns":
-                    remove_dns_entry(target)
+                    try:
+                        remove_dns_entry(target)
+                    except subprocess.CalledProcessError:
+                        pass  # Cleanup is best-effort
             print("Rollback complete.")
         if isinstance(e, subprocess.CalledProcessError):
             sys.exit(f"Command failed: {e.cmd}\n{e.stderr or e.stdout or ''}")
@@ -980,6 +1028,7 @@ def cmd_boot(args):
     with locked_state() as state:
         state["clones"][clone_id] = {
             "flavor": flavor_name,
+            "subnet": subnet,
             "subnet_primary": subnet,
             "subnet_secondary": subnet_sec,
             "vm_name": vm_name,
@@ -990,8 +1039,14 @@ def cmd_boot(args):
         }
 
     print(f'\nCluster "{clone_id}" ready!')
-    print(f"  API:        https://api.{domain}:6443")
-    print(f"  Console:    https://console-openshift-console.apps.{domain}")
+    if haproxy_configured:
+        print(f"  API:        https://api.{domain}:6443")
+        print(f"  Console:    https://console-openshift-console.apps.{domain}")
+    else:
+        print(f"  VM IP:      {vm_ip}")
+        print(f"  SSH:        ssh -i {key_path} core@{vm_ip}")
+        print(f"  Note:       HAProxy not configured. Access cluster via VM IP or run:")
+        print(f"              sudo ./cluster-tool configure-access {clone_id}")
     print(f"  Kubeconfig: {kubeconfig_path}")
     print(f"\nexport KUBECONFIG={kubeconfig_path}")
 
@@ -1137,14 +1192,22 @@ def cmd_destroy(args):
         print(f'Destroying clone "{cid}"...')
 
         destroy_vm(vm)
-        env.run(f"virsh net-destroy test-infra-net-{cid}", check=False)
-        env.run(f"virsh net-undefine test-infra-net-{cid}", check=False)
-        env.run(f"virsh net-destroy test-infra-secondary-network-{cid}", check=False)
-        env.run(f"virsh net-undefine test-infra-secondary-network-{cid}", check=False)
+        env.run(virsh_cmd(f"net-destroy test-infra-net-{cid}"), check=False)
+        env.run(virsh_cmd(f"net-undefine test-infra-net-{cid}"), check=False)
+        env.run(virsh_cmd(f"net-destroy test-infra-secondary-network-{cid}"), check=False)
+        env.run(virsh_cmd(f"net-undefine test-infra-secondary-network-{cid}"), check=False)
         env.run(f"bash -c 'rm -f {REMOTE_OVERLAYS}/{cid}-*.qcow2'")
 
-        remove_haproxy_clone(cid)
-        remove_dns_entry(cid)
+        try:
+            remove_haproxy_clone(cid)
+        except subprocess.CalledProcessError:
+            print("  WARNING: HAProxy cleanup failed (may need sudo).")
+
+        try:
+            remove_dns_entry(cid)
+        except subprocess.CalledProcessError:
+            print("  WARNING: DNS cleanup failed (may need sudo).")
+
         (KUBECONFIG_DIR / f"{cid}.kubeconfig").unlink(missing_ok=True)
 
         with locked_state() as s:
@@ -1297,7 +1360,7 @@ def cmd_pull(args):
                 for d in digests
             )
             env.run(f"bash -c 'set -o pipefail; ({stream}) > {fdir}/{disk_name}'")
-            env.run(f"chown qemu:qemu {fdir}/{disk_name}")
+            env.run(f"chown qemu:qemu {fdir}/{disk_name}", check=False)
         print_step(4, total, f"Reassembling {len(manifest['disks'])} disk(s)", "done")
 
         print_step(5, total, "Registering flavor")
@@ -1377,23 +1440,54 @@ def _setup_client():
 
 
 def _setup_server(*, data_path=None):
-    env.run("test $(id -u) -eq 0", check=True)
+    # Check if we're running as root
+    r = env.run("id -u", check=False)
+    is_root = (r.returncode == 0 and r.stdout.strip() == "0")
+
     print("=== cluster-tool server setup ===")
 
+    # Try to install packages (requires root)
     print("[1/6] Installing packages...")
-    env.run("dnf install -y libvirt qemu-kvm podman pigz haproxy skopeo zstd")
+    if is_root:
+        env.run("dnf install -y libvirt qemu-kvm podman pigz haproxy skopeo zstd")
+    else:
+        # Check if packages are already installed
+        missing = []
+        for pkg in ["virsh", "qemu-kvm", "podman", "pigz", "haproxy", "skopeo", "zstd"]:
+            r = env.run(f"command -v {pkg} >/dev/null 2>&1", check=False)
+            if r.returncode != 0:
+                missing.append(pkg)
+        if missing:
+            print(f"  WARNING: Running without root. Missing packages: {', '.join(missing)}")
+            print(f"  Run 'sudo dnf install -y libvirt qemu-kvm podman pigz haproxy skopeo zstd' to install them.")
+        else:
+            print("  All required packages already installed.")
 
+    # Try to enable services (requires root or proper permissions)
     print("[2/6] Enabling services...")
-    env.run("systemctl enable --now libvirtd")
-    r = env.run("grep -q 'default_backend api-' /etc/haproxy/haproxy.cfg 2>/dev/null", check=False)
-    if r.returncode != 0:
-        env.write_file("/etc/haproxy/haproxy.cfg", HAPROXY_BASE_CONFIG)
-    env.run("setsebool -P haproxy_connect_any 1")
-    env.run("if systemctl is-active firewalld &>/dev/null; then "
-            "firewall-cmd --permanent --add-port=6443/tcp --add-port=443/tcp --add-port=80/tcp && "
-            "firewall-cmd --reload; fi")
-    env.run("systemctl enable --now haproxy")
-    env.run("systemctl restart haproxy")
+    if is_root:
+        env.run("systemctl enable --now libvirtd")
+        r = env.run("grep -q 'default_backend api-' /etc/haproxy/haproxy.cfg 2>/dev/null", check=False)
+        if r.returncode != 0:
+            env.write_file("/etc/haproxy/haproxy.cfg", HAPROXY_BASE_CONFIG)
+        env.run("setsebool -P haproxy_connect_any 1")
+        env.run("if systemctl is-active firewalld &>/dev/null; then "
+                "firewall-cmd --permanent --add-port=6443/tcp --add-port=443/tcp --add-port=80/tcp && "
+                "firewall-cmd --reload; fi")
+        env.run("systemctl enable --now haproxy")
+        env.run("systemctl restart haproxy")
+    else:
+        # Check if services are running
+        r = env.run("systemctl is-active libvirtd", check=False)
+        if r.returncode == 0:
+            print("  libvirtd is already running.")
+        else:
+            print("  WARNING: libvirtd is not running. Run 'sudo systemctl enable --now libvirtd'")
+        r = env.run("systemctl is-active haproxy", check=False)
+        if r.returncode == 0:
+            print("  haproxy is already running.")
+        else:
+            print("  WARNING: haproxy is not running. System configuration requires root.")
 
     print("[3/6] Generating SSH keypair...")
     env.run("mkdir -p ~/.config/cluster-tool")
@@ -1428,7 +1522,7 @@ def _setup_server(*, data_path=None):
     env.run(f"mkdir -p {data_path}/flavors {data_path}/overlays {data_path}/tmp {data_path}/containers/storage")
 
     print("[6/6] Verifying...")
-    env.run("virsh version | head -1")
+    env.run(virsh_cmd("version | head -1"))
     env.run("podman --version")
     env.run("pigz --version")
     env.run("skopeo --version")
@@ -1476,6 +1570,42 @@ def cmd_use(args):
     config["default"] = args.name
     save_servers(config)
     print(f"Default server set to '{args.name}'.")
+
+
+def cmd_configure_access(args):
+    """Configure HAProxy and DNS for a clone. Requires root/sudo."""
+    clone_id = args.clone_id
+
+    state = load_state()
+    if clone_id not in state["clones"]:
+        sys.exit(f"Clone '{clone_id}' not found.")
+
+    clone = state["clones"][clone_id]
+    subnet = clone["subnet"]
+
+    print(f"Configuring access for clone '{clone_id}'...")
+    print("  (sudo may prompt for password)")
+
+    try:
+        add_haproxy_clone(clone_id, subnet)
+        print("  ✓ HAProxy configured")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"ERROR: HAProxy configuration failed: {e}")
+    except Exception as e:
+        sys.exit(f"ERROR: HAProxy configuration failed: {e}")
+
+    try:
+        add_dns_entry(clone_id)
+        print("  ✓ DNS configured")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"ERROR: DNS configuration failed: {e}")
+    except Exception as e:
+        sys.exit(f"ERROR: DNS configuration failed: {e}")
+
+    print(f"\nAccess configured! You can now use:")
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    print(f"  API:     https://api.{domain}:6443")
+    print(f"  Console: https://console-openshift-console.apps.{domain}")
 
 
 def main():
@@ -1527,11 +1657,14 @@ def main():
     use_p = sub.add_parser("use", help="Set default server")
     use_p.add_argument("name", help="Server alias to set as default")
 
-    for p in [snap_p, boot_p, list_p, flavors_p, verify_p, destroy_p, push_p, pull_p]:
+    access_p = sub.add_parser("configure-access", help="Configure HAProxy and DNS for a clone (requires sudo)")
+    access_p.add_argument("clone_id", help="Clone ID to configure access for")
+
+    for p in [snap_p, boot_p, list_p, flavors_p, verify_p, destroy_p, push_p, pull_p, access_p]:
         p.add_argument("--server", help="Server alias (default: from config)")
 
     args = parser.parse_args()
-    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull}
+    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull, "configure-access": cmd_configure_access}
 
     if args.command == "setup":
         cmd_setup(args)
