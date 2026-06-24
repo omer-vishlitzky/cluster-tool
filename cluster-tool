@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+import ipaddress
 import socket
 import xml.etree.ElementTree as ET
 
@@ -71,14 +72,26 @@ def resolve_server(name):
 def resolve_host_ip(hostname):
     try:
         addrs = socket.getaddrinfo(hostname, None)
-        # Filter out IPv6 link-local addresses (fe80::) as they need zone IDs
-        usable = [addr[4][0] for addr in addrs
-                  if not (addr[0] == socket.AF_INET6 and addr[4][0].startswith("fe80:"))]
-        # Prefer IPv4, fall back to usable IPv6
-        ipv4 = [ip for ip in usable if ":" not in ip]
-        return ipv4[0] if ipv4 else (usable[0] if usable else addrs[0][4][0])
-    except (socket.gaierror, IndexError):
-        sys.exit(f"Cannot resolve hostname '{hostname}' to a usable IP address.")
+    except socket.gaierror:
+        sys.exit(f"Cannot resolve hostname '{hostname}'.")
+
+    usable = []
+    for addr in addrs:
+        ip_str = addr[4][0]
+        if addr[0] == socket.AF_INET6:
+            try:
+                if ipaddress.IPv6Address(ip_str).is_link_local:
+                    continue
+            except ValueError:
+                continue
+        usable.append(ip_str)
+
+    ipv4 = [ip for ip in usable if ":" not in ip]
+    if ipv4:
+        return ipv4[0]
+    if usable:
+        return usable[0]
+    sys.exit(f"Cannot resolve hostname '{hostname}' to a usable (non-link-local) IP address.")
 
 SERVER_CONFIG_DIR = "~/.config/cluster-tool"
 SERVER_STATE_FILE = f"{SERVER_CONFIG_DIR}/state.json"

@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -1941,53 +1942,99 @@ class TestConfigLoading(unittest.TestCase):
         ct._init_paths("/data/cluster-tool")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestResolveHostIP(unittest.TestCase):
-    """Test resolve_host_ip() for IPv6 link-local filtering"""
 
     def test_ipv4_only(self):
-        """Should return IPv4 when only IPv4 available"""
         mock_addrs = [
             (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.10', 0)),
         ]
         with patch('socket.getaddrinfo', return_value=mock_addrs):
-            result = ct.resolve_host_ip('example.com')
-            self.assertEqual(result, '192.168.1.10')
+            self.assertEqual(ct.resolve_host_ip('example.com'), '192.168.1.10')
 
-    def test_ipv4_preferred_over_ipv6(self):
-        """Should prefer IPv4 over IPv6 when both available"""
+    def test_ipv6_global_only(self):
         mock_addrs = [
-            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::1', 0, 0, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001::1', 0, 0, 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            self.assertEqual(ct.resolve_host_ip('example.com'), '2001::1')
+
+    def test_mixed_prefers_ipv4(self):
+        mock_addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001::1', 0, 0, 0)),
             (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.10', 0)),
         ]
         with patch('socket.getaddrinfo', return_value=mock_addrs):
-            result = ct.resolve_host_ip('example.com')
-            self.assertEqual(result, '192.168.1.10')
+            self.assertEqual(ct.resolve_host_ip('example.com'), '192.168.1.10')
 
-    def test_filters_ipv6_link_local(self):
-        """Should filter out IPv6 link-local (fe80::) addresses"""
+    def test_link_local_fe80_filtered(self):
         mock_addrs = [
             (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('fe80::1', 0, 0, 0)),
-            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::1', 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 0)),
         ]
         with patch('socket.getaddrinfo', return_value=mock_addrs):
-            result = ct.resolve_host_ip('example.com')
-            self.assertEqual(result, '2001:db8::1')
+            self.assertEqual(ct.resolve_host_ip('example.com'), '10.0.0.1')
 
-    def test_global_ipv6_fallback(self):
-        """Should use global IPv6 when no IPv4"""
+    def test_link_local_fe90_filtered(self):
         mock_addrs = [
-            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::1', 0, 0, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('fe90::1', 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 0)),
         ]
         with patch('socket.getaddrinfo', return_value=mock_addrs):
-            result = ct.resolve_host_ip('example.com')
-            self.assertEqual(result, '2001:db8::1')
+            self.assertEqual(ct.resolve_host_ip('example.com'), '10.0.0.1')
 
-    def test_hostname_not_found(self):
-        """Should exit with error when hostname not resolved"""
-        with patch('socket.getaddrinfo', side_effect=socket.gaierror("Not found")):
+    def test_link_local_fea0_filtered(self):
+        mock_addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('fea0::1', 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            self.assertEqual(ct.resolve_host_ip('example.com'), '10.0.0.1')
+
+    def test_link_local_febf_filtered(self):
+        mock_addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('febf::1', 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            self.assertEqual(ct.resolve_host_ip('example.com'), '10.0.0.1')
+
+    def test_only_link_local_exits(self):
+        mock_addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('fe80::1', 0, 0, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('fe90::2', 0, 0, 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            with self.assertRaises(SystemExit):
+                ct.resolve_host_ip('example.com')
+
+    def test_unresolvable_exits(self):
+        with patch('socket.getaddrinfo', side_effect=socket.gaierror('Not found')):
             with self.assertRaises(SystemExit):
                 ct.resolve_host_ip('nonexistent.invalid')
+
+    def test_mixed_link_local_and_global_ipv6(self):
+        mock_addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('fe80::1', 0, 0, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001::1', 0, 0, 0)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mock_addrs):
+            self.assertEqual(ct.resolve_host_ip('example.com'), '2001::1')
+
+    def test_empty_addrs_exits(self):
+        with patch('socket.getaddrinfo', return_value=[]):
+            with self.assertRaises(SystemExit):
+                ct.resolve_host_ip('example.com')
+
+    def test_resolve_host_ip_replaces_both_call_sites(self):
+        import inspect
+        src = inspect.getsource(ct.cmd_connect)
+        self.assertIn('resolve_host_ip', src)
+        src_main = inspect.getsource(ct.main)
+        self.assertIn('resolve_host_ip', src_main)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
