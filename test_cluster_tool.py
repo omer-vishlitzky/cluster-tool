@@ -721,6 +721,40 @@ class TestTransactionalBoot(unittest.TestCase):
 
     @patch("time.sleep")
     @patch.object(ct, "add_dns_entry")
+    def test_boot_waits_for_operators_not_progressing(self, *_):
+        mock_co_progressing = json.dumps({"items": [
+            {"metadata": {"name": "kube-apiserver"}, "status": {"conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Degraded", "status": "False"},
+                {"type": "Progressing", "status": "True", "message": "NodeInstallerProgressing"},
+            ]}},
+        ]})
+        mock_nodes = self._MOCK_NODES_JSON
+        def ssh_progressing(cmd, check=True):
+            self.calls.append((cmd, check))
+            r = MagicMock()
+            r.returncode = 0
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co_progressing
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
+            else:
+                r.stdout = "ok"
+            r.stderr = ""
+            return r
+
+        wrapped = self.mock_env.wrap_run_positional(ssh_progressing)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_boot(self._boot_args())
+        self.assertIn("Operators not healthy", str(ctx.exception))
+        self.assertIn("kube-apiserver", str(ctx.exception))
+
+    @patch("time.sleep")
+    @patch.object(ct, "add_dns_entry")
     def test_unhealthy_operators_prints_which_ones(self, *_):
         mock_co_bad = json.dumps({"items": [
             {"metadata": {"name": "authentication"}, "status": {"conditions": [
@@ -1302,8 +1336,15 @@ class TestPush(unittest.TestCase):
         r.stderr = ""
         if "command -v" in cmd:
             r.returncode = 0
+        elif "ls -1" in cmd and "wc -l" in cmd:
+            if "disk-0" in cmd:
+                r.stdout = "2"
+            elif "disk-1" in cmd:
+                r.stdout = "1"
+            else:
+                r.stdout = "1"
         elif "ls -1" in cmd and "sort" in cmd:
-            r.stdout = "disk-0.chunk.aa.gz\ndisk-0.chunk.ab.gz\ndisk-1.chunk.aa.gz\n"
+            r.stdout = "disk-0.chunk.aa.zst\ndisk-0.chunk.ab.zst\ndisk-1.chunk.aa.zst\n"
         return r
 
     def _mock_write_file(self, path, content):
@@ -1316,20 +1357,6 @@ class TestPush(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 ct.cmd_push(self._push_args(name="nonexistent"))
         self.assertIn("nonexistent", str(ctx.exception))
-
-    def test_push_prereq_missing_pigz(self):
-        def inner(cmd, check=True):
-            self.calls.append(cmd)
-            r = MagicMock()
-            r.returncode = 1 if "command -v pigz" in cmd else 0
-            r.stdout = ""
-            r.stderr = ""
-            return r
-        wrapped = self.mock_env.wrap_run_positional(inner)
-        with patch.object(ct.env, "run", side_effect=wrapped):
-            with self.assertRaises(SystemExit) as ctx:
-                ct.cmd_push(self._push_args())
-        self.assertIn("pigz", str(ctx.exception))
 
     def test_push_prereq_missing_podman(self):
         def inner(cmd, check=True):
@@ -1353,20 +1380,12 @@ class TestPush(unittest.TestCase):
 
         manifest_path = next(p for p in self.written_files if "manifest.json" in p)
         manifest = json.loads(self.written_files[manifest_path])
-        expected = ct.build_manifest(
-            flavor_name="test-flavor",
-            metadata={
-                "source_cluster": "abc123",
-                "source_primary_subnet": 135,
-                "source_secondary_subnet": 153,
-                "memory_kib": 67108864,
-                "vcpus": 16,
-                "etcd_image": "quay.io/test/etcd:latest",
-                "created_at": "2026-01-01T00:00:00Z",
-            },
-            disk_names=["disk-0.qcow2", "disk-1.qcow2"],
-        )
-        self.assertEqual(manifest, expected)
+        self.assertEqual(manifest["flavor"], "test-flavor")
+        self.assertEqual(manifest["version"], 1)
+        self.assertEqual(len(manifest["disks"]), 2)
+        self.assertEqual(manifest["compression"], "zstd")
+        self.assertEqual(manifest["disks"][0]["chunk_count"], 2)
+        self.assertEqual(manifest["disks"][1]["chunk_count"], 1)
 
     def test_push_generates_dockerfile(self):
         wrapped = self.mock_env.wrap_run_positional(self._inner_mock_run)
@@ -1411,8 +1430,11 @@ class TestPush(unittest.TestCase):
             r.stderr = ""
             if "command -v" in cmd:
                 return r
+            if "ls -1" in cmd and "wc -l" in cmd:
+                r.stdout = "1"
+                return r
             if "ls -1" in cmd and "sort" in cmd:
-                r.stdout = "disk-0.chunk.aa.gz\n"
+                r.stdout = "disk-0.chunk.aa.zst\n"
                 return r
             if "build" in cmd and "podman" in cmd:
                 raise SystemExit("build failed")
@@ -1426,8 +1448,67 @@ class TestPush(unittest.TestCase):
         cleanup_cmds = [c for c in self.calls if "rm -rf /data/cluster-tool/tmp-push-" in c]
         self.assertTrue(len(cleanup_cmds) > 0)
 
+    def test_push_uses_zstd_compression(self):
+        wrapped = self.mock_env.wrap_run_positional(self._inner_mock_run)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self._mock_write_file):
+            ct.cmd_push(self._push_args())
+
+        zstd_cmds = [c for c in self.calls if "zstd" in c and "xargs" in c]
+        self.assertEqual(len(zstd_cmds), 1)
+        self.assertIn("zstd -T1 -3", zstd_cmds[0])
+        pigz_cmds = [c for c in self.calls if "pigz" in c]
+        self.assertEqual(len(pigz_cmds), 0)
+
+    def test_push_manifest_includes_compression_field(self):
+        wrapped = self.mock_env.wrap_run_positional(self._inner_mock_run)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self._mock_write_file):
+            ct.cmd_push(self._push_args())
+
+        manifest_path = next(p for p in self.written_files if "manifest.json" in p)
+        manifest = json.loads(self.written_files[manifest_path])
+        self.assertEqual(manifest["compression"], "zstd")
+
+    def test_push_manifest_includes_chunk_counts(self):
+        wrapped = self.mock_env.wrap_run_positional(self._inner_mock_run)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self._mock_write_file):
+            ct.cmd_push(self._push_args())
+
+        manifest_path = next(p for p in self.written_files if "manifest.json" in p)
+        manifest = json.loads(self.written_files[manifest_path])
+        for disk in manifest["disks"]:
+            self.assertIn("chunk_count", disk)
+        self.assertEqual(manifest["disks"][0]["chunk_count"], 2)
+        self.assertEqual(manifest["disks"][1]["chunk_count"], 1)
+
+    def test_push_checks_zstd_prerequisite(self):
+        def inner(cmd, check=True):
+            self.calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 1 if "command -v zstd" in cmd else 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        wrapped = self.mock_env.wrap_run_positional(inner)
+        with patch.object(ct.env, "run", side_effect=wrapped):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_push(self._push_args())
+        self.assertIn("zstd", str(ctx.exception))
+
 
 class TestPull(unittest.TestCase):
+    _OCI_MANIFEST = json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "layers": [
+            {"digest": "sha256:aaa111", "size": 100},
+            {"digest": "sha256:bbb222", "size": 200},
+            {"digest": "sha256:ccc333", "size": 300},
+        ],
+    })
+
     def setUp(self):
         self.mock_env = MockStateEnv()
         self.mock_env.setup({"flavors": {}, "clones": {}, "next_subnet": 160})
@@ -1436,21 +1517,30 @@ class TestPull(unittest.TestCase):
     def _pull_args(self, image="quay.io/org/repo:tag", name=None):
         return argparse.Namespace(image=image, name=name)
 
+    def _make_flavor_manifest(self, compression="zstd", include_chunk_count=True):
+        manifest = ct.build_manifest(
+            flavor_name="test-pulled",
+            metadata={"source_cluster": "abc", "vcpus": 16, "memory_kib": 67108864,
+                       "source_primary_subnet": 135, "source_secondary_subnet": 153,
+                       "etcd_image": "quay.io/test/etcd", "created_at": "2026-01-01T00:00:00Z"},
+            disk_names=["disk-0.qcow2"],
+        )
+        if compression:
+            manifest["compression"] = compression
+        if include_chunk_count:
+            manifest["disks"][0]["chunk_count"] = 1
+        return manifest
+
     def _inner_mock_run(self, cmd, *, check=True):
         self.calls.append(cmd)
         r = MagicMock()
         r.returncode = 0
         r.stdout = ""
         r.stderr = ""
-        if "cat" in cmd and "manifest.json" in cmd:
-            manifest = ct.build_manifest(
-                flavor_name="test-pulled",
-                metadata={"source_cluster": "abc", "vcpus": 16, "memory_kib": 67108864,
-                           "source_primary_subnet": 135, "source_secondary_subnet": 153,
-                           "etcd_image": "quay.io/test/etcd", "created_at": "2026-01-01T00:00:00Z"},
-                disk_names=["disk-0.qcow2"],
-            )
-            r.stdout = json.dumps(manifest)
+        if "cat" in cmd and "oci/manifest.json" in cmd:
+            r.stdout = self._OCI_MANIFEST
+        elif "gzip -dc" in cmd and "tar xf - -O" in cmd and "aaa111" in cmd:
+            r.stdout = json.dumps(self._make_flavor_manifest())
         return r
 
     def test_pull_prereq_missing_pigz(self):
@@ -1509,16 +1599,11 @@ class TestPull(unittest.TestCase):
             r.returncode = 0
             r.stdout = ""
             r.stderr = ""
-            if "cat" in cmd and "manifest.json" in cmd:
-                manifest = ct.build_manifest(
-                    flavor_name="test-pulled",
-                    metadata={"source_cluster": "abc", "vcpus": 16, "memory_kib": 67108864,
-                               "source_primary_subnet": 135, "source_secondary_subnet": 153,
-                               "etcd_image": "quay.io/test/etcd", "created_at": "2026-01-01T00:00:00Z"},
-                    disk_names=["disk-0.qcow2"],
-                )
-                r.stdout = json.dumps(manifest)
-            if "pigz -d" in cmd:
+            if "cat" in cmd and "oci/manifest.json" in cmd:
+                r.stdout = self._OCI_MANIFEST
+            elif "gzip -dc" in cmd and "aaa111" in cmd:
+                r.stdout = json.dumps(self._make_flavor_manifest())
+            elif "set -o pipefail" in cmd:
                 raise RuntimeError("decompress failed")
             return r
 
@@ -1530,30 +1615,112 @@ class TestPull(unittest.TestCase):
 
         cleanup_rm = [c for c in fail_calls if "rm -rf" in c and "tmp-pull-" in c]
         self.assertTrue(len(cleanup_rm) > 0)
-        cleanup_container = [c for c in fail_calls if "rm" in c and "cluster-tool-pull-" in c]
-        self.assertTrue(len(cleanup_container) > 0)
-        cleanup_image = [c for c in fail_calls if "rmi" in c]
-        self.assertTrue(len(cleanup_image) > 0)
-
-    def test_pull_decompresses_and_reassembles(self):
-        wrapped = self.mock_env.wrap_run(self._inner_mock_run)
-        with patch.object(ct.env, "run", side_effect=wrapped), \
-             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
-            ct.cmd_pull(self._pull_args())
-        pigz_cmds = [c for c in self.calls if "pigz -d" in c]
-        self.assertTrue(len(pigz_cmds) > 0)
-        cat_cmds = [c for c in self.calls if c.startswith("cat ") and ".chunk." in c]
-        self.assertEqual(len(cat_cmds), 1)
-        self.assertIn("disk-0.qcow2", cat_cmds[0])
 
     def test_pull_installs_crypto(self):
         wrapped = self.mock_env.wrap_run(self._inner_mock_run)
         with patch.object(ct.env, "run", side_effect=wrapped), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             ct.cmd_pull(self._pull_args())
-        cp_cmds = [c for c in self.calls if "cp -r" in c and "crypto" in c]
-        self.assertEqual(len(cp_cmds), 1)
-        self.assertIn(ct.flavor_crypto_dir("test-pulled"), cp_cmds[0])
+        crypto_cmds = [c for c in self.calls if "gzip -dc" in c and "bbb222" in c and "crypto" in c]
+        self.assertEqual(len(crypto_cmds), 1)
+
+    def test_pull_uses_skopeo(self):
+        wrapped = self.mock_env.wrap_run(self._inner_mock_run)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_pull(self._pull_args())
+        skopeo_cmds = [c for c in self.calls if "skopeo copy" in c]
+        self.assertEqual(len(skopeo_cmds), 1)
+        self.assertIn("docker://quay.io/org/repo:tag", skopeo_cmds[0])
+        self.assertIn("dir:", skopeo_cmds[0])
+        podman_cmds = [c for c in self.calls if "podman create" in c or "podman cp" in c]
+        self.assertEqual(len(podman_cmds), 0)
+
+    def test_pull_handles_zstd_compression(self):
+        wrapped = self.mock_env.wrap_run(self._inner_mock_run)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_pull(self._pull_args())
+        reassemble_cmds = [c for c in self.calls if "set -o pipefail" in c]
+        self.assertTrue(len(reassemble_cmds) > 0)
+        self.assertIn("zstd -d", reassemble_cmds[0])
+
+    def test_pull_handles_gzip_compression(self):
+        def inner(cmd, *, check=True):
+            self.calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if "cat" in cmd and "oci/manifest.json" in cmd:
+                r.stdout = self._OCI_MANIFEST
+            elif "gzip -dc" in cmd and "aaa111" in cmd:
+                r.stdout = json.dumps(self._make_flavor_manifest(compression="gzip"))
+            return r
+
+        wrapped = self.mock_env.wrap_run(inner)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_pull(self._pull_args())
+        reassemble_cmds = [c for c in self.calls if "set -o pipefail" in c]
+        self.assertTrue(len(reassemble_cmds) > 0)
+        self.assertIn("pigz -d", reassemble_cmds[0])
+        self.assertNotIn("zstd", reassemble_cmds[0])
+
+    def test_pull_defaults_to_gzip_when_no_compression_field(self):
+        def inner(cmd, *, check=True):
+            self.calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if "cat" in cmd and "oci/manifest.json" in cmd:
+                r.stdout = self._OCI_MANIFEST
+            elif "gzip -dc" in cmd and "aaa111" in cmd:
+                r.stdout = json.dumps(self._make_flavor_manifest(compression=None))
+            return r
+
+        wrapped = self.mock_env.wrap_run(inner)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_pull(self._pull_args())
+        reassemble_cmds = [c for c in self.calls if "set -o pipefail" in c]
+        self.assertIn("pigz -d", reassemble_cmds[0])
+
+    def test_pull_missing_chunk_count_exits(self):
+        def inner(cmd, *, check=True):
+            self.calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if "cat" in cmd and "oci/manifest.json" in cmd:
+                r.stdout = self._OCI_MANIFEST
+            elif "gzip -dc" in cmd and "aaa111" in cmd:
+                r.stdout = json.dumps(self._make_flavor_manifest(include_chunk_count=False))
+            return r
+
+        wrapped = self.mock_env.wrap_run(inner)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_pull(self._pull_args())
+        self.assertIn("chunk_count", str(ctx.exception))
+        self.assertIn("Re-push", str(ctx.exception))
+
+    def test_pull_checks_skopeo_prerequisite(self):
+        def inner(cmd, *, check=True):
+            self.calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 1 if "command -v skopeo" in cmd else 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        wrapped = self.mock_env.wrap_run(inner)
+        with patch.object(ct.env, "run", side_effect=wrapped):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_pull(self._pull_args())
+        self.assertIn("skopeo", str(ctx.exception))
 
 
 class TestSetupClient(unittest.TestCase):
@@ -1575,6 +1742,73 @@ class TestSetupClient(unittest.TestCase):
              patch("pathlib.Path.exists", return_value=True), \
              patch("pathlib.Path.is_symlink", return_value=False):
             ct._setup_client()
+
+    @patch("os.geteuid", return_value=0)
+    @patch("time.sleep")
+    def test_setup_client_disables_standalone_dnsmasq(self, _, __):
+        calls = []
+        def track_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=0)
+        with patch.dict(os.environ, {"SUDO_USER": "testuser"}, clear=False), \
+             patch("subprocess.run", side_effect=track_run), \
+             patch("pathlib.Path.write_text"), \
+             patch("pathlib.Path.read_text", return_value="nameserver 127.0.0.1"), \
+             patch("pathlib.Path.mkdir"), \
+             patch("pathlib.Path.unlink"), \
+             patch("pathlib.Path.exists", return_value=True):
+            ct._setup_client()
+        disable_calls = [c for c in calls if c == ["systemctl", "disable", "--now", "dnsmasq"]]
+        self.assertEqual(len(disable_calls), 1)
+
+    @patch("os.geteuid", return_value=0)
+    @patch("time.sleep")
+    def test_setup_client_disable_before_nm_config(self, _, __):
+        call_order = []
+        def track_run(cmd, **kwargs):
+            if cmd == ["systemctl", "disable", "--now", "dnsmasq"]:
+                call_order.append("disable_dnsmasq")
+            elif cmd == ["systemctl", "restart", "NetworkManager"]:
+                call_order.append("restart_nm")
+            return MagicMock(returncode=0)
+        def track_write(*args, **kw):
+            content = args[0] if len(args) == 1 else (args[1] if len(args) > 1 else "")
+            if isinstance(content, str) and "dns=dnsmasq" in content:
+                call_order.append("nm_config")
+        with patch.dict(os.environ, {"SUDO_USER": "testuser"}, clear=False), \
+             patch("subprocess.run", side_effect=track_run), \
+             patch("pathlib.Path.write_text", side_effect=track_write), \
+             patch("pathlib.Path.read_text", return_value="nameserver 127.0.0.1"), \
+             patch("pathlib.Path.mkdir"), \
+             patch("pathlib.Path.unlink"), \
+             patch("pathlib.Path.exists", return_value=True):
+            ct._setup_client()
+        self.assertIn("disable_dnsmasq", call_order)
+        self.assertIn("nm_config", call_order)
+        disable_idx = call_order.index("disable_dnsmasq")
+        nm_idx = call_order.index("nm_config")
+        self.assertLess(disable_idx, nm_idx)
+
+    @patch("os.geteuid", return_value=0)
+    @patch("time.sleep")
+    def test_setup_client_disable_idempotent(self, _, __):
+        calls = []
+        def track_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return MagicMock(returncode=0)
+        with patch.dict(os.environ, {"SUDO_USER": "testuser"}, clear=False), \
+             patch("subprocess.run", side_effect=track_run), \
+             patch("pathlib.Path.write_text"), \
+             patch("pathlib.Path.read_text", return_value="nameserver 127.0.0.1"), \
+             patch("pathlib.Path.mkdir"), \
+             patch("pathlib.Path.unlink"), \
+             patch("pathlib.Path.exists", return_value=True):
+            ct._setup_client()
+        disable_calls = [(cmd, kw) for cmd, kw in calls if cmd == ["systemctl", "disable", "--now", "dnsmasq"]]
+        self.assertEqual(len(disable_calls), 1)
+        _, kwargs = disable_calls[0]
+        self.assertNotIn("check", kwargs, "disable call must not use check=True (idempotent)")
+        self.assertTrue(kwargs.get("capture_output", False))
 
     @patch("os.geteuid", return_value=0)
     @patch("subprocess.run")
@@ -1668,6 +1902,8 @@ class TestSetupServer(unittest.TestCase):
         self.assertIn("qemu-kvm", dnf_cmds[0])
         self.assertIn("podman", dnf_cmds[0])
         self.assertIn("pigz", dnf_cmds[0])
+        self.assertIn("skopeo", dnf_cmds[0])
+        self.assertIn("zstd", dnf_cmds[0])
 
     def test_server_enables_libvirtd(self):
         with patch.object(ct.env, "run", side_effect=self._mock_run):
@@ -1695,8 +1931,8 @@ class TestSetupServer(unittest.TestCase):
         with patch.object(ct.env, "run", side_effect=self._mock_run):
             ct._setup_server(data_path="/tmp/test-data")
 
-        verify_cmds = [c for c in self.calls if any(t in c for t in ["virsh version", "podman --version", "pigz --version"])]
-        self.assertEqual(len(verify_cmds), 3)
+        verify_cmds = [c for c in self.calls if any(t in c for t in ["virsh version", "podman --version", "pigz --version", "skopeo --version", "zstd --version"])]
+        self.assertEqual(len(verify_cmds), 5)
 
     def test_server_interactive_uses_detected_path(self):
         with patch.object(ct.env, "run", side_effect=self._mock_run), \
