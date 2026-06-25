@@ -1941,5 +1941,313 @@ class TestConfigLoading(unittest.TestCase):
         ct._init_paths("/data/cluster-tool")
 
 
+class TestReloadHaproxy(unittest.TestCase):
+    def setUp(self):
+        self.mock_env = MockStateEnv()
+        self.mock_env.setup()
+        self.calls = []
+
+    def _make_mock_run(self, active_rc=0, reload_rc=0):
+        def mock_run(cmd, *, check=True):
+            self.calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = ""
+            if "systemctl is-active haproxy" in cmd:
+                r.returncode = active_rc
+            elif "systemctl reload haproxy" in cmd:
+                r.returncode = reload_rc
+            elif "systemctl restart haproxy" in cmd:
+                r.returncode = 0
+            if check and r.returncode != 0:
+                import sys
+                sys.exit(f"Command failed: {cmd}")
+            return r
+        return mock_run
+
+    def test_reload_when_active_and_reload_succeeds(self):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(active_rc=0, reload_rc=0)):
+            ct._reload_haproxy()
+        self.assertTrue(any("systemctl reload haproxy" in c for c in self.calls))
+        self.assertFalse(any("systemctl restart haproxy" in c for c in self.calls))
+
+    def test_restart_when_inactive(self):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(active_rc=3)):
+            ct._reload_haproxy()
+        self.assertTrue(any("systemctl restart haproxy" in c for c in self.calls))
+        self.assertFalse(any("systemctl reload haproxy" in c for c in self.calls))
+
+    def test_restart_when_reload_fails(self):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(active_rc=0, reload_rc=1)):
+            ct._reload_haproxy()
+        self.assertTrue(any("systemctl reload haproxy" in c for c in self.calls))
+        self.assertTrue(any("systemctl restart haproxy" in c for c in self.calls))
+
+
+class TestWriteHaproxyCfg(unittest.TestCase):
+    def setUp(self):
+        ct.env = ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1")
+        self.calls = []
+        self.written_files = {}
+
+    def _make_mock_run(self, validate_rc=0):
+        def mock_run(cmd, *, check=True):
+            self.calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = ""
+            if "haproxy -c -f" in cmd:
+                r.returncode = validate_rc
+                if validate_rc != 0:
+                    r.stderr = "invalid config"
+            if check and r.returncode != 0:
+                import sys
+                sys.exit(f"Command failed: {cmd}")
+            return r
+        return mock_run
+
+    def _mock_write_file(self, path, content):
+        self.written_files[path] = content
+
+    def test_writes_to_tmp_validates_and_renames(self):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(validate_rc=0)), \
+             patch.object(ct.env, "write_file", side_effect=self._mock_write_file):
+            ct._write_haproxy_cfg("test config")
+        self.assertIn("/etc/haproxy/.haproxy.cfg.tmp", self.written_files)
+        self.assertTrue(any("cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak" in c for c in self.calls))
+        self.assertTrue(any("haproxy -c -f /etc/haproxy/.haproxy.cfg.tmp" in c for c in self.calls))
+        self.assertTrue(any("mv /etc/haproxy/.haproxy.cfg.tmp /etc/haproxy/haproxy.cfg" in c for c in self.calls))
+
+    def test_validation_failure_removes_tmp_and_exits(self):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(validate_rc=1)), \
+             patch.object(ct.env, "write_file", side_effect=self._mock_write_file):
+            with self.assertRaises(SystemExit) as ctx:
+                ct._write_haproxy_cfg("bad config")
+        self.assertIn("validation failed", str(ctx.exception))
+        self.assertTrue(any("rm -f /etc/haproxy/.haproxy.cfg.tmp" in c for c in self.calls))
+        self.assertFalse(any("mv " in c for c in self.calls))
+
+    def test_backup_created_before_write(self):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(validate_rc=0)), \
+             patch.object(ct.env, "write_file", side_effect=self._mock_write_file):
+            ct._write_haproxy_cfg("test config")
+        bak_idx = next(i for i, c in enumerate(self.calls) if "haproxy.cfg.bak" in c)
+        write_idx = next(i for i, c in enumerate(self.calls) if "haproxy -c" in c)
+        self.assertLess(bak_idx, write_idx)
+
+
+class TestRollbackResilience(unittest.TestCase):
+    _INITIAL_STATE = {
+        "flavors": {
+            "default": {
+                "source_cluster": "6ef80144",
+                "source_primary_subnet": 135,
+                "source_secondary_subnet": 153,
+                "memory_kib": 67108864,
+                "vcpus": 16,
+                "disks": ["disk-0.qcow2"],
+                "etcd_image": "quay.io/test/etcd:latest",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        },
+        "clones": {},
+        "next_subnet": 160,
+    }
+
+    _MOCK_CO_JSON = json.dumps({"items": [
+        {"metadata": {"name": "test"}, "status": {"conditions": [
+            {"type": "Available", "status": "True"},
+            {"type": "Progressing", "status": "False"},
+            {"type": "Degraded", "status": "False"},
+        ]}}
+    ]})
+    _MOCK_NODES_JSON = json.dumps({"items": [
+        {"metadata": {"name": "test-node"}, "status": {"conditions": [
+            {"type": "Ready", "status": "True"},
+        ]}}
+    ]})
+
+    def setUp(self):
+        self.mock_env = MockStateEnv()
+        self.mock_env.setup(self._INITIAL_STATE)
+        self.calls = []
+
+    def _boot_args(self):
+        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=False)
+
+    @patch("time.sleep")
+    def test_rollback_continues_after_haproxy_failure(self, _):
+        """If remove_haproxy_clone fails during rollback, remaining cleanup still runs.
+
+        Fail at identity verification (step 9) which happens after haproxy is
+        added (step 7), so the haproxy cleanup entry exists in the cleanup list.
+        """
+        haproxy_remove_called = []
+        dns_remove_called = []
+        mock_co = self._MOCK_CO_JSON
+        mock_nodes = self._MOCK_NODES_JSON
+
+        def ssh(cmd, check=True):
+            self.calls.append((cmd, check))
+            # Fail at identity verification — after haproxy+dns are already set up
+            if "infrastructure cluster" in cmd:
+                r = MagicMock()
+                r.returncode = 0
+                r.stdout = "https://api.WRONG-DOMAIN.redhat.com:6443"
+                r.stderr = ""
+                return r
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
+            elif "virsh domstate " in cmd:
+                vm = cmd.split("virsh domstate ")[1]
+                r.returncode = 1
+                r.stderr = "Domain not found"
+            else:
+                r.stdout = "ok"
+            return r
+
+        def mock_add_haproxy(clone_id, subnet):
+            pass  # no-op, just let it be added to cleanup list
+
+        def mock_remove_haproxy(clone_id):
+            haproxy_remove_called.append(clone_id)
+            raise SystemExit("haproxy is down")
+
+        def mock_add_dns(clone_id):
+            pass
+
+        def mock_remove_dns(clone_id):
+            dns_remove_called.append(clone_id)
+
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file), \
+             patch.object(ct, "add_haproxy_clone", side_effect=mock_add_haproxy), \
+             patch.object(ct, "remove_haproxy_clone", side_effect=mock_remove_haproxy), \
+             patch.object(ct, "add_dns_entry", side_effect=mock_add_dns), \
+             patch.object(ct, "remove_dns_entry", side_effect=mock_remove_dns):
+            with self.assertRaises(SystemExit):
+                ct.cmd_boot(self._boot_args())
+
+        # haproxy cleanup was attempted and failed
+        self.assertEqual(haproxy_remove_called, ["aabbccdd"])
+        # dns cleanup still ran despite haproxy failure
+        self.assertEqual(dns_remove_called, ["aabbccdd"])
+        # other cleanup (vm, nets, overlays) also ran
+        cleanup = [cmd for cmd, chk in self.calls if any(
+            k in cmd for k in ["rm -f /data/cluster-tool/overlays",
+                                "virsh net-destroy", "virsh net-undefine",
+                                "virsh destroy ", "virsh undefine "]
+        )]
+        self.assertTrue(any("net-destroy" in c for c in cleanup))
+        self.assertTrue(any("rm -f" in c for c in cleanup))
+
+
+class TestParseHaproxyCloneIds(unittest.TestCase):
+    def test_extracts_clone_ids(self):
+        config = (
+            "frontend api\n"
+            "    use_backend api-clone1 if { req_ssl_sni }\n"
+            "    use_backend api-clone2 if { req_ssl_sni }\n"
+            "    default_backend api-fallback\n"
+            "\n"
+            "backend api-fallback\n"
+            "    server fallback 127.0.0.1:1\n"
+            "\n"
+            "backend api-clone1\n"
+            "    server api 192.168.160.10:6443\n"
+            "\n"
+            "backend api-clone2\n"
+            "    server api 192.168.161.10:6443\n"
+        )
+        ids = ct._parse_haproxy_clone_ids(config)
+        self.assertEqual(ids, {"clone1", "clone2"})
+
+    def test_no_clones_returns_empty(self):
+        ids = ct._parse_haproxy_clone_ids(ct.HAPROXY_BASE_CONFIG)
+        # fallback backends should not be returned (they contain '-' but aren't clones)
+        self.assertEqual(ids, set())
+
+    def test_ignores_non_api_backends(self):
+        config = (
+            "backend api-myclone\n"
+            "    server api 192.168.160.10:6443\n"
+            "backend ingress-https-myclone\n"
+            "    server ingress 192.168.160.10:443\n"
+        )
+        ids = ct._parse_haproxy_clone_ids(config)
+        self.assertEqual(ids, {"myclone"})
+
+
+class TestCleanupHaproxy(unittest.TestCase):
+    def setUp(self):
+        self.mock_env = MockStateEnv()
+        self.mock_env.setup()
+        self.calls = []
+
+    def _make_mock_run(self, live_vms=None):
+        live_vms = live_vms or set()
+        def mock_run(cmd, *, check=True):
+            self.calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = ""
+            if "cat /etc/haproxy/haproxy.cfg" in cmd:
+                r.stdout = (
+                    "frontend api\n"
+                    "    default_backend api-fallback\n"
+                    "backend api-fallback\n"
+                    "    server fallback 127.0.0.1:1\n"
+                    "backend api-live1\n"
+                    "    server api 192.168.160.10:6443\n"
+                    "backend api-dead1\n"
+                    "    server api 192.168.161.10:6443\n"
+                )
+            elif "virsh dominfo" in cmd:
+                vm = cmd.split("virsh dominfo ")[1]
+                if not any(v in vm for v in live_vms):
+                    r.returncode = 1
+                    r.stderr = "Domain not found"
+            if check and r.returncode != 0:
+                import sys
+                sys.exit(f"Command failed: {cmd}")
+            return r
+        return mock_run
+
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "remove_dns_entry")
+    def test_removes_orphaned_entries(self, mock_dns, mock_haproxy):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(live_vms={"live1"})):
+            ct.cmd_cleanup_haproxy(argparse.Namespace())
+        mock_haproxy.assert_called_once_with("dead1")
+        mock_dns.assert_called_once_with("dead1")
+
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "remove_dns_entry")
+    def test_skips_live_entries(self, mock_dns, mock_haproxy):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(live_vms={"live1", "dead1"})):
+            ct.cmd_cleanup_haproxy(argparse.Namespace())
+        mock_haproxy.assert_not_called()
+        mock_dns.assert_not_called()
+
+    @patch.object(ct, "remove_dns_entry")
+    def test_continues_after_removal_failure(self, mock_dns):
+        with patch.object(ct.env, "run", side_effect=self._make_mock_run(live_vms=set())), \
+             patch.object(ct, "remove_haproxy_clone", side_effect=SystemExit("haproxy down")):
+            ct.cmd_cleanup_haproxy(argparse.Namespace())
+        # dns removal was still attempted for both
+        self.assertEqual(mock_dns.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -480,6 +480,28 @@ def _strip_haproxy_clone(config, clone_id):
     return "\n".join(filtered)
 
 
+def _write_haproxy_cfg(config):
+    """Atomically write haproxy.cfg: write to temp file, validate, rename."""
+    env.run("cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak")
+    tmp_path = "/etc/haproxy/.haproxy.cfg.tmp"
+    env.write_file(tmp_path, config)
+    r = env.run(f"haproxy -c -f {tmp_path}", check=False)
+    if r.returncode != 0:
+        env.run(f"rm -f {tmp_path}")
+        sys.exit(f"haproxy config validation failed:\n{r.stderr}")
+    env.run(f"mv {tmp_path} /etc/haproxy/haproxy.cfg")
+
+
+def _reload_haproxy():
+    """Reload haproxy, recovering from stopped state if necessary."""
+    r = env.run("systemctl is-active haproxy", check=False)
+    if r.returncode == 0:
+        r = env.run("systemctl reload haproxy", check=False)
+        if r.returncode == 0:
+            return
+    env.run("systemctl restart haproxy")
+
+
 def add_haproxy_clone(clone_id, subnet):
     with locked_haproxy():
         use_backends, backends = gen_haproxy_additions(clone_id, subnet)
@@ -491,16 +513,16 @@ def add_haproxy_clone(clone_id, subnet):
             config = config.replace(marker, f"{use_backends[key]}\n\n{marker}", 1)
 
         config = config.rstrip() + "\n" + backends
-        env.write_file("/etc/haproxy/haproxy.cfg", config)
-        env.run("systemctl reload haproxy")
+        _write_haproxy_cfg(config)
+        _reload_haproxy()
 
 
 def remove_haproxy_clone(clone_id):
     with locked_haproxy():
         result = env.run("cat /etc/haproxy/haproxy.cfg")
         config = _strip_haproxy_clone(result.stdout, clone_id)
-        env.write_file("/etc/haproxy/haproxy.cfg", config)
-        env.run("systemctl reload haproxy")
+        _write_haproxy_cfg(config)
+        _reload_haproxy()
 
 
 def add_dns_entry(clone_id):
@@ -959,19 +981,22 @@ def cmd_boot(args):
         else:
             print(f"\nBoot failed, rolling back...")
             for kind, target in reversed(cleanup):
-                if kind == "vm":
-                    destroy_vm(target)
-                elif kind == "net":
-                    env.run(f"virsh net-destroy {target}")
-                    env.run(f"virsh net-undefine {target}")
-                elif kind == "rm":
-                    env.run(f"rm -f {target}")
-                elif kind == "kubeconfig":
-                    target.unlink(missing_ok=True)
-                elif kind == "haproxy":
-                    remove_haproxy_clone(target)
-                elif kind == "dns":
-                    remove_dns_entry(target)
+                try:
+                    if kind == "vm":
+                        destroy_vm(target)
+                    elif kind == "net":
+                        env.run(f"virsh net-destroy {target}")
+                        env.run(f"virsh net-undefine {target}")
+                    elif kind == "rm":
+                        env.run(f"rm -f {target}")
+                    elif kind == "kubeconfig":
+                        target.unlink(missing_ok=True)
+                    elif kind == "haproxy":
+                        remove_haproxy_clone(target)
+                    elif kind == "dns":
+                        remove_dns_entry(target)
+                except (SystemExit, Exception) as cleanup_err:
+                    print(f"  Warning: {kind} cleanup failed: {cleanup_err}")
             print("Rollback complete.")
         if isinstance(e, subprocess.CalledProcessError):
             sys.exit(f"Command failed: {e.cmd}\n{e.stderr or e.stdout or ''}")
@@ -1150,6 +1175,49 @@ def cmd_destroy(args):
         with locked_state() as s:
             s["clones"].pop(cid, None)
         print(f'Clone "{cid}" destroyed.')
+
+
+def _parse_haproxy_clone_ids(config):
+    """Extract clone IDs from haproxy backend names like 'backend api-CLONEID'."""
+    import re
+    ids = set()
+    for m in re.finditer(r'^backend api-(.+)$', config, re.MULTILINE):
+        cid = m.group(1)
+        if cid != "fallback":
+            ids.add(cid)
+    return ids
+
+
+def cmd_cleanup_haproxy(args):
+    result = env.run("cat /etc/haproxy/haproxy.cfg")
+    clone_ids = _parse_haproxy_clone_ids(result.stdout)
+    if not clone_ids:
+        print("No clone entries found in haproxy config.")
+        return
+
+    orphaned = []
+    for cid in clone_ids:
+        vm_name = f"test-infra-cluster-{cid}-master-0"
+        r = env.run(f"virsh dominfo {vm_name}", check=False)
+        if r.returncode != 0:
+            orphaned.append(cid)
+
+    if not orphaned:
+        print(f"All {len(clone_ids)} haproxy clone entries have live VMs.")
+        return
+
+    print(f"Found {len(orphaned)} orphaned haproxy entries (no matching VM):")
+    for cid in orphaned:
+        print(f"  Removing: {cid}")
+        try:
+            remove_haproxy_clone(cid)
+        except (SystemExit, Exception) as e:
+            print(f"    Warning: failed to remove haproxy entry: {e}")
+        try:
+            remove_dns_entry(cid)
+        except (SystemExit, Exception) as e:
+            print(f"    Warning: failed to remove DNS entry: {e}")
+    print(f"Cleaned up {len(orphaned)} orphaned entries.")
 
 
 def cmd_push(args):
@@ -1522,16 +1590,18 @@ def main():
     connect_p.add_argument("--host", required=True, help="SSH target (e.g., root@hostname) or 'local'")
     connect_p.add_argument("--data-path", help="Data directory (auto-detected if omitted)")
 
+    cleanup_hp = sub.add_parser("cleanup-haproxy", help="Remove orphaned haproxy entries for dead VMs")
+
     sub.add_parser("servers", help="List connected servers")
 
     use_p = sub.add_parser("use", help="Set default server")
     use_p.add_argument("name", help="Server alias to set as default")
 
-    for p in [snap_p, boot_p, list_p, flavors_p, verify_p, destroy_p, push_p, pull_p]:
+    for p in [snap_p, boot_p, list_p, flavors_p, verify_p, destroy_p, push_p, pull_p, cleanup_hp]:
         p.add_argument("--server", help="Server alias (default: from config)")
 
     args = parser.parse_args()
-    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull}
+    cmds = {"snapshot": cmd_snapshot, "boot": cmd_boot, "list": cmd_list, "flavors": cmd_flavors, "verify": cmd_verify, "destroy": cmd_destroy, "push": cmd_push, "pull": cmd_pull, "cleanup-haproxy": cmd_cleanup_haproxy}
 
     if args.command == "setup":
         cmd_setup(args)
