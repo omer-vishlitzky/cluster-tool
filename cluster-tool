@@ -325,7 +325,7 @@ def gen_primary_network_xml(clone_id, subnet, mac):
 
 def detect_vm_emulator():
     candidates = " ".join(shlex.quote(c) for c in VM_EMULATOR_CANDIDATES)
-    script = f"for p in {candidates}; do test -x $p && echo $p && exit 0; done; command -v qemu-system-x86_64 2>/dev/null || command -v qemu-kvm 2>/dev/null"
+    script = f"for p in {candidates}; do test -x $p && echo $p && exit 0; done; command -v qemu-system-x86_64 || command -v qemu-kvm"
     r = env.run(f"bash -c '{script}'", check=False)
     path = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
     if not path:
