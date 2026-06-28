@@ -157,7 +157,7 @@ DNSMASQ_DIR = Path("/etc/NetworkManager/dnsmasq.d")
 def load_state():
     r = env.run(f"cat {SERVER_STATE_FILE}", check=False)
     if r.returncode != 0:
-        return {"flavors": {}, "clones": {}, "next_subnet": SUBNET_START}
+        return {"flavors": {}, "clones": {}}
     return json.loads(r.stdout)
 
 
@@ -704,6 +704,12 @@ def cmd_boot(args):
             sys.exit(f"Clone '{clone_id}' already exists.")
 
         subnet = allocate_subnet(state)
+        state["clones"][clone_id] = {
+            "flavor": flavor_name,
+            "subnet_primary": subnet,
+            "subnet_secondary": subnet + SUBNET_SECONDARY_OFFSET,
+            "status": "booting",
+        }
 
     subnet_sec = subnet + SUBNET_SECONDARY_OFFSET
     mac1, mac2 = generate_mac(), generate_mac()
@@ -983,6 +989,8 @@ def cmd_boot(args):
                     remove_haproxy_clone(target)
                 elif kind == "dns":
                     remove_dns_entry(target)
+            with locked_state() as s:
+                s["clones"].pop(clone_id, None)
             print("Rollback complete.")
         if isinstance(e, subprocess.CalledProcessError):
             sys.exit(f"Command failed: {e.cmd}\n{e.stderr or e.stdout or ''}")
