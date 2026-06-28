@@ -83,7 +83,7 @@ def resolve_host_ip(hostname):
                 if ipaddress.IPv6Address(ip_str).is_link_local:
                     continue
             except ValueError:
-                continue
+                sys.exit(f"Cannot parse IPv6 address '{ip_str}' from hostname '{hostname}'.")
         usable.append(ip_str)
 
     ipv4 = [ip for ip in usable if ":" not in ip]
