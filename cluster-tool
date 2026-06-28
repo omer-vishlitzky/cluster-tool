@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+import ipaddress
 import socket
 import xml.etree.ElementTree as ET
 
@@ -66,6 +67,31 @@ def resolve_server(name):
     if name not in config["servers"]:
         sys.exit(f"Server '{name}' not found. Run './cluster-tool connect {name} --host ...' first.")
     return config["servers"][name]["host"]
+
+
+def resolve_host_ip(hostname):
+    try:
+        addrs = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        sys.exit(f"Cannot resolve hostname '{hostname}'.")
+
+    usable = []
+    for addr in addrs:
+        ip_str = addr[4][0]
+        if addr[0] == socket.AF_INET6:
+            try:
+                if ipaddress.IPv6Address(ip_str).is_link_local:
+                    continue
+            except ValueError:
+                sys.exit(f"Cannot parse IPv6 address '{ip_str}' from hostname '{hostname}'.")
+        usable.append(ip_str)
+
+    ipv4 = [ip for ip in usable if ":" not in ip]
+    if ipv4:
+        return ipv4[0]
+    if usable:
+        return usable[0]
+    sys.exit(f"Cannot resolve hostname '{hostname}' to a usable (non-link-local) IP address.")
 
 SERVER_CONFIG_DIR = "~/.config/cluster-tool"
 SERVER_STATE_FILE = f"{SERVER_CONFIG_DIR}/state.json"
@@ -1462,10 +1488,7 @@ def cmd_connect(args):
     global env
     host = args.host
     hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
-    try:
-        host_ip = socket.getaddrinfo(hostname, None)[0][4][0]
-    except socket.gaierror:
-        sys.exit(f"Cannot resolve hostname '{hostname}'.")
+    host_ip = resolve_host_ip(hostname)
     env = ExecutionEnv(host=host, host_ip=host_ip)
     _setup_server(data_path=args.data_path)
     config = load_servers()
@@ -1582,10 +1605,7 @@ def main():
         host = resolve_server(server_name)
 
     hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
-    try:
-        host_ip = socket.getaddrinfo(hostname, None)[0][4][0]
-    except socket.gaierror:
-        sys.exit(f"Cannot resolve hostname '{hostname}'.")
+    host_ip = resolve_host_ip(hostname)
     env = ExecutionEnv(host=host, host_ip=host_ip)
 
     r = env.run("cat ~/.config/cluster-tool/config", check=False)
