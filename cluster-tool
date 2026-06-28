@@ -583,9 +583,12 @@ def cmd_snapshot(args):
     if vm_state != "running":
         sys.exit(f"Source VM '{vm_name}' is '{vm_state}', expected 'running'")
 
+    strip_secrets = args.strip_secrets
+    total_steps = 11 if strip_secrets else 10
+
     print(f"Creating snapshot flavor '{flavor_name}' from {vm_name}...")
 
-    print_step(1, 10, "Detecting etcd image")
+    print_step(1, total_steps, "Detecting etcd image")
     etcd_r = env.run_vm(vm_ip,
         "sudo python3 -c \""
         "import yaml, json; "
@@ -593,9 +596,9 @@ def cmd_snapshot(args):
         "print(next(c['image'] for c in d['spec']['containers'] if c['name']=='etcd'))\"",
         check=False)
     etcd_image = etcd_r.stdout.strip() if etcd_r.returncode == 0 and etcd_r.stdout.strip() else ETCD_IMAGE
-    print_step(1, 10, "Detecting etcd image", "done")
+    print_step(1, total_steps, "Detecting etcd image", "done")
 
-    print_step(2, 10, "Extracting crypto keys")
+    print_step(2, total_steps, "Extracting crypto keys")
     node_kc = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
     temp_kc = f"/tmp/kubeconfig-{source_id}"
     env.run(f"ssh {' '.join(SSH_OPTS)} core@{vm_ip} 'sudo cat {node_kc}' > {temp_kc}")
@@ -616,19 +619,19 @@ def cmd_snapshot(args):
         sys.exit("Failed to extract ingress operator CN")
     env.run(f"echo '{ingress_cn.stdout.strip()}' > {crypto}/ingress-cn.txt")
     env.run(f"rm -f {temp_kc}")
-    print_step(2, 10, "Extracting crypto keys", "done")
+    print_step(2, total_steps, "Extracting crypto keys", "done")
 
-    print_step(3, 10, "Injecting SSH key")
+    print_step(3, total_steps, "Injecting SSH key")
     pub_key = env.run("cat ~/.config/cluster-tool/cluster-tool.key.pub").stdout.strip()
     env.run_vm(vm_ip, f"echo '{pub_key}' | sudo tee -a /home/core/.ssh/authorized_keys > /dev/null")
-    print_step(3, 10, "Injecting SSH key", "done")
+    print_step(3, total_steps, "Injecting SSH key", "done")
 
-    print_step(4, 10, "Copying SSH keypair to crypto")
+    print_step(4, total_steps, "Copying SSH keypair to crypto")
     env.run(f"cp ~/.config/cluster-tool/cluster-tool.key {crypto}/cluster-tool.key")
     env.run(f"cp ~/.config/cluster-tool/cluster-tool.key.pub {crypto}/cluster-tool.key.pub")
-    print_step(4, 10, "Copying SSH keypair to crypto", "done")
+    print_step(4, total_steps, "Copying SSH keypair to crypto", "done")
 
-    print_step(5, 10, "Preparing etcd for clean boot")
+    print_step(5, total_steps, "Preparing etcd for clean boot")
     env.run_vm(vm_ip,
         "cd /etc/kubernetes/static-pod-resources && "
         "rev=$(ls -d etcd-pod-* 2>/dev/null | sed 's/etcd-pod-//' | sort -n | tail -1) && "
@@ -638,16 +641,30 @@ def cmd_snapshot(args):
         "for f in etcd-pod-${rev}/secrets/etcd-all-certs/*; do "
         "  sudo ln \"$f\" \"etcd-certs/secrets/etcd-all-certs/$(basename $f)\"; "
         "done")
-    print_step(5, 10, "Preparing etcd for clean boot", "done")
+    print_step(5, total_steps, "Preparing etcd for clean boot", "done")
 
-    print_step(6, 10, "Pruning unused container images")
+    print_step(6, total_steps, "Pruning unused container images")
     env.run_vm(vm_ip,
         "sudo crictl ps -a --state exited -q 2>/dev/null | xargs -r sudo crictl rm && "
         "sudo crictl --timeout 120s rmi --prune && "
         "sudo podman image prune -a -f")
-    print_step(6, 10, "Pruning unused container images", "done")
+    print_step(6, total_steps, "Pruning unused container images", "done")
 
-    print_step(7, 10, "Shutting down VM")
+    step = 7
+    if strip_secrets:
+        print_step(step, total_steps, "Stripping cluster secrets")
+        node_kc = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
+        oc_vm = f"sudo oc --kubeconfig={node_kc} --insecure-skip-tls-verify"
+        empty_auth = '{"auths":{}}'
+        env.run_vm(vm_ip,
+            f"{oc_vm} set data secret/pull-secret -n openshift-config "
+            f"--from-literal=.dockerconfigjson='{empty_auth}'")
+        env.run_vm(vm_ip,
+            f"echo '{empty_auth}' | sudo tee /var/lib/kubelet/config.json > /dev/null")
+        print_step(step, total_steps, "Stripping cluster secrets", "done")
+        step += 1
+
+    print_step(step, total_steps, "Shutting down VM")
     env.run(f"virsh shutdown {vm_name}")
     for _ in range(150):
         r = env.run(f"virsh domstate {vm_name}")
@@ -656,22 +673,25 @@ def cmd_snapshot(args):
         time.sleep(2)
     else:
         sys.exit("VM did not shut down in 5 minutes")
-    print_step(7, 10, "Shutting down VM", "done")
+    print_step(step, total_steps, "Shutting down VM", "done")
+    step += 1
 
-    print_step(8, 10, "Creating directories")
+    print_step(step, total_steps, "Creating directories")
     env.run(f"mkdir -p {fdir} {REMOTE_OVERLAYS}")
-    print_step(8, 10, "Creating directories", "done")
+    print_step(step, total_steps, "Creating directories", "done")
+    step += 1
 
-    print_step(9, 10, f"Copying {len(disks)} disk(s)")
+    print_step(step, total_steps, f"Copying {len(disks)} disk(s)")
     for i, disk in enumerate(disks):
         dest = f"{fdir}/disk-{i}.qcow2"
         env.run(f"qemu-img convert -O qcow2 {disk['path']} {dest}")
         env.run(f"chown qemu:qemu {dest}")
-    print_step(9, 10, f"Copying {len(disks)} disk(s)", "done")
+    print_step(step, total_steps, f"Copying {len(disks)} disk(s)", "done")
+    step += 1
 
-    print_step(10, 10, "Restarting source VM")
+    print_step(step, total_steps, "Restarting source VM")
     env.run(f"virsh start {vm_name}")
-    print_step(10, 10, "Restarting source VM", "done")
+    print_step(step, total_steps, "Restarting source VM", "done")
 
     with locked_state() as state:
         state["flavors"][flavor_name] = {
@@ -724,7 +744,13 @@ def cmd_boot(args):
     key_path = f"{crypto}/cluster-tool.key"
     env.run(f"chmod 600 {key_path}", check=False)
 
-    total = 9
+    pull_secret_path = args.pull_secret
+    if pull_secret_path:
+        pull_secret_path = os.path.expanduser(pull_secret_path)
+        if not os.path.isfile(pull_secret_path):
+            sys.exit(f"Pull secret file not found: {pull_secret_path}")
+
+    total = 10 if pull_secret_path else 9
     print(f'Creating clone "{clone_id}"...')
     cleanup = []
 
@@ -971,6 +997,19 @@ def cmd_boot(args):
         print_step(9, total, "Verifying cluster identity")
         verify_cluster_identity(vm_ip, clone_id, domain, identity=key_path)
         print_step(9, total, "Verifying cluster identity", "done")
+
+        if pull_secret_path:
+            print_step(10, total, "Injecting pull secret")
+            pull_secret_content = Path(pull_secret_path).read_text().strip()
+            ps_b64 = base64.b64encode(pull_secret_content.encode()).decode()
+            env.run_vm(vm_ip,
+                f"echo {ps_b64} | base64 -d | sudo tee /var/lib/kubelet/config.json > /dev/null",
+                identity=key_path)
+            env.run_vm(vm_ip,
+                f"{oc_vm} set data secret/pull-secret -n openshift-config "
+                f"--from-literal=.dockerconfigjson=\"$(echo {ps_b64} | base64 -d)\"",
+                identity=key_path)
+            print_step(10, total, "Injecting pull secret", "done")
 
     except (SystemExit, subprocess.CalledProcessError) as e:
         if args.no_rollback:
@@ -1555,11 +1594,13 @@ def main():
     snap_p = sub.add_parser("snapshot", help="Create a named snapshot flavor from a running cluster")
     snap_p.add_argument("--name", required=True, help="Flavor name (e.g., sno-64, sno-cnv)")
     snap_p.add_argument("--source", required=True, help="Source cluster ID (8 hex chars from VM name)")
+    snap_p.add_argument("--strip-secrets", action="store_true", help="Strip pull-secret and kubelet config.json before snapshot (for safe distribution)")
 
     boot_p = sub.add_parser("boot", help="Boot a fresh cluster from a snapshot flavor")
     boot_p.add_argument("--flavor", help="Flavor to boot from (default: most recent)")
     boot_p.add_argument("--name", help="Clone ID (random if omitted)")
     boot_p.add_argument("--no-rollback", action="store_true", help="Preserve failed clone for debugging (don't rollback on failure)")
+    boot_p.add_argument("--pull-secret", metavar="PATH", help="Path to pull-secret JSON file to inject after boot")
 
     list_p = sub.add_parser("list", help="Show running clones")
 
