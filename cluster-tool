@@ -807,6 +807,8 @@ def cmd_boot(args):
     key_path = f"{crypto}/cluster-tool.key"
     env.run(f"chmod 600 {key_path}", check=False)
 
+    vm_emulator, vm_machine_type = resolve_vm_platform()
+
     total = 9
     print(f'Creating clone "{clone_id}"...')
     cleanup = []
@@ -837,7 +839,6 @@ def cmd_boot(args):
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24", "done")
 
         print_step(3, total, "Booting VM")
-        vm_emulator, vm_machine_type = resolve_vm_platform()
         vm_xml = gen_vm_xml(
             clone_id, overlays, mac1, mac2,
             memory_kib=memory_kib, vcpus=vcpus,
