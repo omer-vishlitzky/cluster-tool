@@ -201,8 +201,6 @@ class TestStateManagement(unittest.TestCase):
         }
         s = ct.allocate_subnet(state)
         self.assertEqual(s, 161)
-        # Also verify 178 is not usable as a primary
-        self.assertIn(178, {160, 178})
 
     def test_allocate_subnet_exhaustion_accounts_for_flavors(self):
         state = {"flavors": {}, "clones": {}}
@@ -239,6 +237,22 @@ class TestStateManagement(unittest.TestCase):
         s = ct.allocate_subnet(state)
         # 160 and 160+18=178 are reserved by clone, 135 and 135+18=153 by flavor
         self.assertEqual(s, 161)
+
+    def test_cmd_list_with_booting_entry(self):
+        self.mock_env.save_initial_state({
+            "flavors": {},
+            "clones": {
+                "booting1": {
+                    "flavor": "test-flavor",
+                    "subnet_primary": 160,
+                    "subnet_secondary": 178,
+                    "status": "booting",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                },
+            },
+        })
+        with patch.object(ct.env, "run", side_effect=self.mock_env.mock_run):
+            ct.cmd_list(MagicMock())
 
 
 class TestIDGeneration(unittest.TestCase):

@@ -709,6 +709,7 @@ def cmd_boot(args):
             "subnet_primary": subnet,
             "subnet_secondary": subnet + SUBNET_SECONDARY_OFFSET,
             "status": "booting",
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
     subnet_sec = subnet + SUBNET_SECONDARY_OFFSET
