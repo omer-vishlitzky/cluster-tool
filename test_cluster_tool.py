@@ -488,8 +488,8 @@ class TestTransactionalBoot(unittest.TestCase):
         self.mock_env.setup(self._INITIAL_STATE)
         self.calls = []
 
-    def _boot_args(self, no_rollback=False):
-        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=no_rollback)
+    def _boot_args(self, no_rollback=False, pull_secret=None):
+        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=no_rollback, pull_secret=pull_secret)
 
     def _make_ssh_mock(self, fail_on):
         destroyed = set()
@@ -2364,6 +2364,133 @@ class TestGenVmXmlPlatformParams(unittest.TestCase):
         self.assertIn("<emulator>/usr/libexec/qemu-kvm</emulator>", xml)
         self.assertNotIn(ct.DEFAULT_VM_EMULATOR, xml)
         self.assertNotIn(ct.DEFAULT_VM_MACHINE_TYPE, xml)
+class TestPullSecretInjection(unittest.TestCase):
+    _INITIAL_STATE = TestTransactionalBoot._INITIAL_STATE
+
+    def setUp(self):
+        self.mock_env = MockStateEnv()
+        self.mock_env.setup(self._INITIAL_STATE)
+        self.calls = []
+
+    def _boot_args(self, pull_secret=None):
+        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=False, pull_secret=pull_secret)
+
+    def _make_all_succeed_ssh(self):
+        mock_co = TestTransactionalBoot._MOCK_CO_JSON
+        mock_nodes = TestTransactionalBoot._MOCK_NODES_JSON
+        def ssh(cmd, check=True):
+            self.calls.append((cmd, check))
+            r = MagicMock()
+            r.returncode = 0
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "infrastructure cluster" in cmd:
+                r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
+            else:
+                r.stdout = "ok"
+            r.stderr = ""
+            return r
+        return ssh
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_boot_pull_secret_injected_before_crio_start(self, *_):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, f)
+            ps_path = f.name
+        try:
+            ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+            with patch.object(ct.env, "run", side_effect=ssh), \
+                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file), \
+                 patch("subprocess.run", return_value=MagicMock(returncode=0)):
+                ct.cmd_boot(self._boot_args(pull_secret=ps_path))
+
+            cmds = [cmd for cmd, _ in self.calls]
+            ps_copy_idx = next(i for i, c in enumerate(cmds)
+                               if "cp /tmp/pull-secret.json /var/lib/kubelet/config.json" in c)
+            crio_start_idx = next(i for i, c in enumerate(cmds)
+                                  if "systemctl start crio" in c)
+            self.assertLess(ps_copy_idx, crio_start_idx,
+                "pull secret must be injected before CRI-O starts")
+        finally:
+            os.unlink(ps_path)
+            ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_boot_pull_secret_updates_cluster_secret(self, *_):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, f)
+            ps_path = f.name
+        try:
+            ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+            with patch.object(ct.env, "run", side_effect=ssh), \
+                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file), \
+                 patch("subprocess.run", return_value=MagicMock(returncode=0)):
+                ct.cmd_boot(self._boot_args(pull_secret=ps_path))
+
+            cmds = [cmd for cmd, _ in self.calls]
+            oc_set_cmds = [c for c in cmds if "set data secret/pull-secret" in c]
+            self.assertEqual(len(oc_set_cmds), 1)
+            self.assertIn("openshift-config", oc_set_cmds[0])
+            self.assertIn("/var/lib/kubelet/config.json", oc_set_cmds[0])
+        finally:
+            os.unlink(ps_path)
+            ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_boot_pull_secret_missing_file_exits(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_boot(self._boot_args(pull_secret="/nonexistent/pull-secret.json"))
+        self.assertIn("not found", str(ctx.exception))
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_boot_without_pull_secret_no_injection(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args(pull_secret=None))
+
+        cmds = [cmd for cmd, _ in self.calls]
+        self.assertFalse(any("pull-secret.json" in c for c in cmds),
+            "no pull secret injection should happen when --pull-secret is not provided")
+        self.assertFalse(any("set data secret/pull-secret" in c for c in cmds))
+        ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_recert_uses_pull_missing(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args())
+
+        cmds = [cmd for cmd, _ in self.calls]
+        recert_cmd = next(c for c in cmds if "podman run --rm --name recert" in c)
+        self.assertIn("--pull=missing", recert_cmd)
+        self.assertNotIn("--pull=newer", recert_cmd)
+        ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()
 
