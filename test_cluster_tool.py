@@ -118,21 +118,141 @@ class TestStateManagement(unittest.TestCase):
         state = ct.load_state()
         self.assertEqual(state["flavors"], {})
         self.assertEqual(state["clones"], {})
-        self.assertEqual(state["next_subnet"], 160)
 
     def test_save_and_load_roundtrip(self):
-        state = {"flavors": {"test": {"source": "abc"}}, "clones": {}, "next_subnet": 162}
+        state = {"flavors": {"test": {"source": "abc"}}, "clones": {}}
         ct.save_state(state)
         loaded = ct.load_state()
         self.assertEqual(loaded, state)
 
-    def test_allocate_subnet_increments(self):
+    def test_allocate_subnet_returns_first_free(self):
         state = ct.load_state()
         s1 = ct.allocate_subnet(state)
-        s2 = ct.allocate_subnet(state)
         self.assertEqual(s1, 160)
+
+    def test_allocate_subnet_skips_reserved(self):
+        state = {
+            "flavors": {"f1": {"source_primary_subnet": 160, "source_secondary_subnet": 178}},
+            "clones": {},
+        }
+        s1 = ct.allocate_subnet(state)
+        # 160 and 178 are reserved by flavor, so 160 is skipped.
+        # candidate 161: secondary=179, both free -> should return 161
+        self.assertEqual(s1, 161)
+
+    def test_allocate_subnet_skips_clone_subnets(self):
+        state = {
+            "flavors": {},
+            "clones": {"c1": {"subnet_primary": 160, "subnet_secondary": 178}},
+        }
+        s1 = ct.allocate_subnet(state)
+        self.assertEqual(s1, 161)
+
+    def test_allocate_subnet_recycles_after_destroy(self):
+        state = {
+            "flavors": {},
+            "clones": {"c2": {"subnet_primary": 161, "subnet_secondary": 179}},
+        }
+        # Clone at 160 was destroyed, so 160 should be available again
+        s1 = ct.allocate_subnet(state)
+        self.assertEqual(s1, 160)
+
+    def test_allocate_subnet_exhausted(self):
+        state = {"flavors": {}, "clones": {}}
+        # Fill all possible slots
+        for i in range(ct.SUBNET_START, 256 - ct.SUBNET_SECONDARY_OFFSET):
+            state["clones"][f"c{i}"] = {
+                "subnet_primary": i,
+                "subnet_secondary": i + ct.SUBNET_SECONDARY_OFFSET,
+            }
+        with self.assertRaises(SystemExit) as ctx:
+            ct.allocate_subnet(state)
+        self.assertIn("No available subnets", str(ctx.exception))
+
+    def test_allocate_subnet_skips_flavor_primary_subnets(self):
+        state = {
+            "flavors": {"f1": {"source_primary_subnet": 161, "source_secondary_subnet": 179}},
+            "clones": {},
+        }
+        s = ct.allocate_subnet(state)
+        self.assertEqual(s, 160)
+
+    def test_allocate_subnet_skips_flavor_secondary_subnets(self):
+        state = {
+            "flavors": {"f1": {"source_primary_subnet": 135, "source_secondary_subnet": 170}},
+            "clones": {},
+        }
+        s = ct.allocate_subnet(state)
+        # 160's secondary is 178 -- both free, so 160 should be returned
+        self.assertEqual(s, 160)
+        # But if a flavor's secondary sits exactly on a candidate...
+        state2 = {
+            "flavors": {"f1": {"source_primary_subnet": 135, "source_secondary_subnet": 178}},
+            "clones": {},
+        }
+        s2 = ct.allocate_subnet(state2)
+        # candidate 160 -> secondary 178 is reserved -> skip 160
         self.assertEqual(s2, 161)
-        self.assertEqual(state["next_subnet"], 162)
+
+    def test_allocate_subnet_skips_secondary_of_clones(self):
+        state = {
+            "flavors": {},
+            "clones": {"c1": {"subnet_primary": 160, "subnet_secondary": 178}},
+        }
+        s = ct.allocate_subnet(state)
+        self.assertEqual(s, 161)
+
+    def test_allocate_subnet_exhaustion_accounts_for_flavors(self):
+        state = {"flavors": {}, "clones": {}}
+        # Fill all but one slot
+        for i in range(ct.SUBNET_START, 256 - ct.SUBNET_SECONDARY_OFFSET):
+            state["clones"][f"c{i}"] = {
+                "subnet_primary": i,
+                "subnet_secondary": i + ct.SUBNET_SECONDARY_OFFSET,
+            }
+        # All slots taken
+        with self.assertRaises(SystemExit):
+            ct.allocate_subnet(state)
+        # Free two clones to create one usable slot: primary and secondary
+        # ranges overlap, so one deletion alone can't free both a candidate
+        # and its secondary
+        del state["clones"][f"c{ct.SUBNET_START}"]
+        del state["clones"][f"c{ct.SUBNET_START + ct.SUBNET_SECONDARY_OFFSET}"]
+        s = ct.allocate_subnet(state)
+        self.assertEqual(s, ct.SUBNET_START)
+        # Now add a flavor that reserves that slot
+        state["flavors"]["f1"] = {
+            "source_primary_subnet": ct.SUBNET_START,
+            "source_secondary_subnet": ct.SUBNET_START + ct.SUBNET_SECONDARY_OFFSET,
+        }
+        with self.assertRaises(SystemExit):
+            ct.allocate_subnet(state)
+
+    def test_allocate_subnet_backward_compat_missing_secondary(self):
+        state = {
+            "flavors": {"f1": {"source_primary_subnet": 135}},
+            "clones": {"c1": {"subnet_primary": 160}},
+        }
+        # Missing subnet_secondary should fall back to primary + OFFSET
+        s = ct.allocate_subnet(state)
+        # 160 and 160+18=178 are reserved by clone, 135 and 135+18=153 by flavor
+        self.assertEqual(s, 161)
+
+    def test_cmd_list_with_booting_entry(self):
+        self.mock_env.save_initial_state({
+            "flavors": {},
+            "clones": {
+                "booting1": {
+                    "flavor": "test-flavor",
+                    "subnet_primary": 160,
+                    "subnet_secondary": 178,
+                    "status": "booting",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                },
+            },
+        })
+        with patch.object(ct.env, "run", side_effect=self.mock_env.mock_run):
+            ct.cmd_list(MagicMock())
 
 
 class TestIDGeneration(unittest.TestCase):
@@ -336,7 +456,6 @@ class TestTransactionalBoot(unittest.TestCase):
             },
         },
         "clones": {},
-        "next_subnet": 160,
     }
 
     def setUp(self):
@@ -842,6 +961,77 @@ class TestTransactionalBoot(unittest.TestCase):
         self.assertTrue(kubeconfig.exists())
         kubeconfig.unlink(missing_ok=True)
 
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_concurrent_boot_reservation(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
+        with patch.object(ct.env, "run", side_effect=ssh), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args())
+
+        state_after_first = self.mock_env.get_saved_state()
+        self.assertIn("aabbccdd", state_after_first["clones"])
+        self.assertEqual(state_after_first["clones"]["aabbccdd"]["subnet_primary"], 160)
+        s2 = ct.allocate_subnet(state_after_first)
+        self.assertEqual(s2, 161)
+        kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
+        kubeconfig.unlink(missing_ok=True)
+
+    @patch("time.sleep")
+    @patch.object(ct.ExecutionEnv, "write_file")
+    @patch.object(ct, "add_dns_entry")
+    @patch.object(ct.ExecutionEnv, "copy_from")
+    def test_boot_failure_cleans_clone_reservation(self, *_):
+        ssh = self.mock_env.wrap_run_positional(self._make_ssh_mock("virsh net-define /tmp/net-"))
+        with patch.object(ct.env, "run", side_effect=ssh):
+            with self.assertRaises(SystemExit):
+                ct.cmd_boot(self._boot_args())
+
+        state = self.mock_env.get_saved_state()
+        self.assertEqual(state["clones"], {})
+
+    @patch("time.sleep")
+    @patch.object(ct, "remove_dns_entry")
+    @patch.object(ct, "remove_haproxy_clone")
+    @patch.object(ct, "add_dns_entry")
+    def test_booting_entry_registered_before_long_boot(self, *_):
+        states_during_boot = []
+        mock_co = self._MOCK_CO_JSON
+        mock_nodes = self._MOCK_NODES_JSON
+        def ssh_capture_state(cmd, check=True):
+            self.calls.append((cmd, check))
+            if "virsh define /tmp/vm-" in cmd:
+                states_during_boot.append(self.mock_env.get_saved_state())
+            r = MagicMock()
+            r.returncode = 0
+            if "ingress-cn" in cmd:
+                r.stdout = "fake-ingress-cn"
+            elif "infrastructure cluster" in cmd:
+                r.stdout = "https://api.test-infra-cluster-aabbccdd.redhat.com:6443"
+            elif "get co -o json" in cmd:
+                r.stdout = mock_co
+            elif "get nodes -o json" in cmd:
+                r.stdout = mock_nodes
+            else:
+                r.stdout = "ok"
+            r.stderr = ""
+            return r
+
+        wrapped = self.mock_env.wrap_run_positional(ssh_capture_state)
+        with patch.object(ct.env, "run", side_effect=wrapped), \
+             patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
+            ct.cmd_boot(self._boot_args())
+
+        self.assertTrue(len(states_during_boot) > 0)
+        mid_boot_state = states_during_boot[0]
+        self.assertIn("aabbccdd", mid_boot_state["clones"])
+        self.assertEqual(mid_boot_state["clones"]["aabbccdd"]["status"], "booting")
+        self.assertEqual(mid_boot_state["clones"]["aabbccdd"]["subnet_primary"], 160)
+        kubeconfig = ct.KUBECONFIG_DIR / "aabbccdd.kubeconfig"
+        kubeconfig.unlink(missing_ok=True)
+
 
 class TestDetectSourceVM(unittest.TestCase):
     def setUp(self):
@@ -936,7 +1126,7 @@ class TestFlavorState(unittest.TestCase):
 class TestSnapshot(unittest.TestCase):
     def setUp(self):
         self.mock_env = MockStateEnv()
-        self.mock_env.setup({"flavors": {}, "clones": {}, "next_subnet": 160})
+        self.mock_env.setup({"flavors": {}, "clones": {}})
         self.calls = []
 
     def _snapshot_args(self):
@@ -1026,8 +1216,7 @@ class TestSnapshot(unittest.TestCase):
     def test_snapshot_existing_flavor_exits(self, _):
         self.mock_env.save_initial_state({
             "flavors": {"test-snap": {"source_cluster": "old"}},
-            "clones": {}, "next_subnet": 160,
-        })
+            "clones": {}})
         with patch.object(ct.env, "run", side_effect=self.mock_env.mock_run), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             with self.assertRaises(SystemExit) as ctx:
@@ -1220,7 +1409,7 @@ class TestSnapshot(unittest.TestCase):
 class TestLocking(unittest.TestCase):
     def setUp(self):
         self.mock_env = MockStateEnv()
-        self.mock_env.setup({"flavors": {}, "clones": {}, "next_subnet": 160})
+        self.mock_env.setup({"flavors": {}, "clones": {}})
         self.run_calls = []
 
     def _tracking_mock_run(self, cmd, *, check=True):
@@ -1250,6 +1439,7 @@ class TestLocking(unittest.TestCase):
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
             with ct.locked_state() as state:
                 s1 = ct.allocate_subnet(state)
+                state["clones"]["c1"] = {"subnet_primary": s1, "subnet_secondary": s1 + ct.SUBNET_SECONDARY_OFFSET}
             with ct.locked_state() as state:
                 s2 = ct.allocate_subnet(state)
         self.assertEqual(s1, 160)
@@ -1335,7 +1525,6 @@ class TestPush(unittest.TestCase):
             },
         },
         "clones": {},
-        "next_subnet": 160,
     }
 
     def setUp(self):
@@ -1482,7 +1671,7 @@ class TestPush(unittest.TestCase):
 class TestPull(unittest.TestCase):
     def setUp(self):
         self.mock_env = MockStateEnv()
-        self.mock_env.setup({"flavors": {}, "clones": {}, "next_subnet": 160})
+        self.mock_env.setup({"flavors": {}, "clones": {}})
         self.calls = []
 
     _MANIFEST_DIGEST = "aaa111"
@@ -1563,8 +1752,7 @@ class TestPull(unittest.TestCase):
     def test_pull_existing_flavor_exits(self):
         self.mock_env.save_initial_state({
             "flavors": {"test-pulled": {"disks": []}},
-            "clones": {}, "next_subnet": 160,
-        })
+            "clones": {}})
         wrapped = self.mock_env.wrap_run(self._inner_mock_run)
         with patch.object(ct.env, "run", side_effect=wrapped), \
              patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
