@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import random
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -178,6 +179,16 @@ def parse_manifest(raw):
 RECERT_IMAGE = "quay.io/rh-ee-ovishlit/recert:latest"
 ETCD_IMAGE = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:96e7c7f2ccac380f0b57c6b3be73c09df05d46b3ff7864acb1ba4fc063d72508"
 DNSMASQ_DIR = Path("/etc/NetworkManager/dnsmasq.d")
+DEFAULT_VM_MACHINE_TYPE = "q35"
+DEFAULT_VM_EMULATOR = "/usr/bin/qemu-system-x86_64"
+VM_EMULATOR_CANDIDATES = [
+    "/usr/bin/qemu-system-x86_64",
+    "/usr/libexec/qemu-kvm",
+    "/usr/sbin/qemu-kvm",
+    "/usr/bin/qemu-kvm",
+]
+VM_MACHINE_PREFERENCES = ["q35", "pc-q35", "pc"]
+VM_MACHINE_PREFIX_PREFERENCES = ["pc-q35-", "q35-", "pc-i440fx-", "pc-"]
 
 
 def load_state():
@@ -312,6 +323,54 @@ def gen_primary_network_xml(clone_id, subnet, mac):
           </dnsmasq:options>
         </network>""")
 
+def detect_vm_emulator():
+    candidates = " ".join(shlex.quote(c) for c in VM_EMULATOR_CANDIDATES)
+    script = f"for p in {candidates}; do test -x $p && echo $p && exit 0; done; command -v qemu-system-x86_64 || command -v qemu-kvm"
+    r = env.run(f"bash -c '{script}'", check=False)
+    path = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
+    if not path:
+        sys.exit("No QEMU emulator found on the target host. Install qemu-kvm or qemu-system-x86_64.")
+    return path
+
+
+def _parse_machine_types(machine_help):
+    machine_types = []
+    for line in machine_help.splitlines():
+        token = line.strip().split(None, 1)
+        if not token:
+            continue
+        machine_types.append(token[0])
+    return machine_types
+
+
+def detect_vm_machine_type(emulator):
+    r = env.run(f"{shlex.quote(emulator)} -machine help", check=False)
+    if r.returncode != 0:
+        sys.exit(f"Failed to query machine types from {emulator}. Is QEMU installed correctly?")
+
+    machine_types = _parse_machine_types(r.stdout)
+    machine_set = set(machine_types)
+
+    for preferred in VM_MACHINE_PREFERENCES:
+        if preferred in machine_set:
+            return preferred
+
+    for prefix in VM_MACHINE_PREFIX_PREFERENCES:
+        for machine in machine_types:
+            if machine.startswith(prefix):
+                return machine
+
+    if machine_types:
+        return machine_types[0]
+
+    sys.exit(f"No machine types found in {emulator} -machine help output.")
+
+
+def resolve_vm_platform():
+    emulator = detect_vm_emulator()
+    machine_type = detect_vm_machine_type(emulator)
+    return emulator, machine_type
+
 
 def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
@@ -346,7 +405,9 @@ def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
         </network>""")
 
 
-def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=67108864, vcpus=16):
+def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary,
+               memory_kib=67108864, vcpus=16,
+               machine_type=DEFAULT_VM_MACHINE_TYPE, emulator=DEFAULT_VM_EMULATOR):
     if isinstance(overlay_disks, str):
         overlay_disks = [overlay_disks]
     disk_xml = ""
@@ -365,7 +426,7 @@ def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=6
           <currentMemory unit='KiB'>{memory_kib}</currentMemory>
           <vcpu placement='static'>{vcpus}</vcpu>
           <os>
-            <type arch='x86_64' machine='pc-i440fx-rhel7.6.0'>hvm</type>
+            <type arch='x86_64' machine='{machine_type}'>hvm</type>
             <boot dev='hd'/>
           </os>
           <features><acpi/><apic/><pae/></features>
@@ -375,7 +436,7 @@ def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary, memory_kib=6
           <on_reboot>restart</on_reboot>
           <on_crash>destroy</on_crash>
           <devices>
-            <emulator>/usr/libexec/qemu-kvm</emulator>{disk_xml}
+            <emulator>{emulator}</emulator>{disk_xml}
             <controller type='scsi' index='0' model='virtio-scsi'/>
             <interface type='network'>
               <mac address='{mac_primary}'/>
@@ -746,6 +807,8 @@ def cmd_boot(args):
     key_path = f"{crypto}/cluster-tool.key"
     env.run(f"chmod 600 {key_path}", check=False)
 
+    vm_emulator, vm_machine_type = resolve_vm_platform()
+
     total = 9
     print(f'Creating clone "{clone_id}"...')
     cleanup = []
@@ -776,7 +839,11 @@ def cmd_boot(args):
         print_step(2, total, f"Creating network 192.168.{subnet}.0/24", "done")
 
         print_step(3, total, "Booting VM")
-        vm_xml = gen_vm_xml(clone_id, overlays, mac1, mac2, memory_kib=memory_kib, vcpus=vcpus)
+        vm_xml = gen_vm_xml(
+            clone_id, overlays, mac1, mac2,
+            memory_kib=memory_kib, vcpus=vcpus,
+            machine_type=vm_machine_type, emulator=vm_emulator,
+        )
         env.write_file(f"/tmp/vm-{clone_id}.xml", vm_xml)
         env.run(f"virsh define /tmp/vm-{clone_id}.xml")
         env.run(f"virsh start {vm_name}")
