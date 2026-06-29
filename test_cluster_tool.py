@@ -2364,6 +2364,56 @@ class TestGenVmXmlPlatformParams(unittest.TestCase):
         self.assertIn("<emulator>/usr/libexec/qemu-kvm</emulator>", xml)
         self.assertNotIn(ct.DEFAULT_VM_EMULATOR, xml)
         self.assertNotIn(ct.DEFAULT_VM_MACHINE_TYPE, xml)
+class TestRunVmQuoting(unittest.TestCase):
+    def setUp(self):
+        self.env = ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1")
+        self.captured_cmd = None
+
+        def capture_run(cmd, *, check=True):
+            self.captured_cmd = cmd
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "test-output"
+            r.stderr = ""
+            return r
+
+        self.env.run = capture_run
+
+    def test_remote_run_vm_preserves_single_quotes(self):
+        cmd = """sudo python3 -c "d=open('/etc/test').read(); print(d['key'])" """
+        self.env.run_vm("192.168.1.10", cmd)
+        self.assertIn("192.168.1.10", self.captured_cmd)
+        self.assertNotIn("'{cmd}'", self.captured_cmd)
+        inner = self.captured_cmd.split("core@192.168.1.10 ", 1)[1]
+        import ast
+        try:
+            reconstructed = ast.literal_eval(inner)
+        except (ValueError, SyntaxError):
+            reconstructed = None
+        self.assertEqual(reconstructed, cmd,
+            "shlex.quote must produce a shell-safe string that reconstructs the original command")
+
+    def test_remote_run_vm_simple_command_works(self):
+        self.env.run_vm("192.168.1.10", "echo hello")
+        self.assertIn("echo hello", self.captured_cmd)
+
+    def test_local_run_vm_passes_cmd_directly(self):
+        local_env = ct.ExecutionEnv(host="local", host_ip="127.0.0.1")
+        captured = {}
+        original_run = subprocess.run
+        def mock_run(*args, **kwargs):
+            captured["args"] = args[0] if args else kwargs.get("args")
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        with patch("subprocess.run", side_effect=mock_run):
+            local_env.run_vm("192.168.1.10", "sudo python3 -c \"open('/etc/test')\"")
+        self.assertIsInstance(captured["args"], list)
+        self.assertEqual(captured["args"][-1], "sudo python3 -c \"open('/etc/test')\"")
+
+
 class TestPullSecretInjection(unittest.TestCase):
     _INITIAL_STATE = TestTransactionalBoot._INITIAL_STATE
 

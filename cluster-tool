@@ -131,7 +131,7 @@ class ExecutionEnv:
                 sys.exit(f"SSH command failed (exit {r.returncode}): {cmd}\n{r.stderr.strip()}")
             return r
         id_flag = f"-i {identity} " if identity else ""
-        jump = f"ssh {' '.join(SSH_OPTS)} {id_flag}core@{vm_ip} '{cmd}'"
+        jump = f"ssh {' '.join(SSH_OPTS)} {id_flag}core@{vm_ip} {shlex.quote(cmd)}"
         return self.run(jump, check=check)
 
     def copy_from(self, remote_path, local_path):
