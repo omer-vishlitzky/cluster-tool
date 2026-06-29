@@ -2400,24 +2400,23 @@ class TestPullSecretInjection(unittest.TestCase):
     @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
     @patch.object(ct, "add_dns_entry")
-    def test_boot_pull_secret_injected_before_crio_start(self, *_):
+    def test_boot_pull_secret_not_written_to_node(self, *_):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, f)
             ps_path = f.name
         try:
             ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
             with patch.object(ct.env, "run", side_effect=ssh), \
-                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file), \
-                 patch("subprocess.run", return_value=MagicMock(returncode=0)):
+                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
                 ct.cmd_boot(self._boot_args(pull_secret=ps_path))
 
             cmds = [cmd for cmd, _ in self.calls]
-            ps_copy_idx = next(i for i, c in enumerate(cmds)
-                               if "cp /tmp/pull-secret.json /var/lib/kubelet/config.json" in c)
-            crio_start_idx = next(i for i, c in enumerate(cmds)
-                                  if "systemctl start crio" in c)
-            self.assertLess(ps_copy_idx, crio_start_idx,
-                "pull secret must be injected before CRI-O starts")
+            self.assertFalse(
+                any("cp" in c and "pull-secret" in c and "/var/lib/kubelet/config.json" in c for c in cmds),
+                "pull secret must not be written directly to node — MCO owns that file")
+            self.assertFalse(
+                any("tee /var/lib/kubelet/config.json" in c for c in cmds),
+                "pull secret must not be written directly to node — MCO owns that file")
         finally:
             os.unlink(ps_path)
             ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
@@ -2426,22 +2425,27 @@ class TestPullSecretInjection(unittest.TestCase):
     @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
     @patch.object(ct, "add_dns_entry")
-    def test_boot_pull_secret_updates_cluster_secret(self, *_):
+    def test_boot_pull_secret_injected_after_health_before_operators(self, *_):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, f)
             ps_path = f.name
         try:
             ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
             with patch.object(ct.env, "run", side_effect=ssh), \
-                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file), \
-                 patch("subprocess.run", return_value=MagicMock(returncode=0)):
+                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
                 ct.cmd_boot(self._boot_args(pull_secret=ps_path))
 
             cmds = [cmd for cmd, _ in self.calls]
             oc_set_cmds = [c for c in cmds if "set data secret/pull-secret" in c]
             self.assertEqual(len(oc_set_cmds), 1)
             self.assertIn("openshift-config", oc_set_cmds[0])
-            self.assertIn("/var/lib/kubelet/config.json", oc_set_cmds[0])
+            healthz_idx = next(i for i, c in enumerate(cmds) if "healthz" in c)
+            set_idx = next(i for i, c in enumerate(cmds) if "set data secret/pull-secret" in c)
+            co_idx = next(i for i, c in enumerate(cmds) if "get co -o json" in c)
+            self.assertGreater(set_idx, healthz_idx,
+                "pull secret must be set after API health check")
+            self.assertLess(set_idx, co_idx,
+                "pull secret must be set before operator check")
         finally:
             os.unlink(ps_path)
             ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)

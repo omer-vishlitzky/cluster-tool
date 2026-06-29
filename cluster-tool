@@ -962,17 +962,6 @@ def cmd_boot(args):
             pull_secret_path = os.path.expanduser(pull_secret_path)
             if not os.path.isfile(pull_secret_path):
                 sys.exit(f"Pull secret not found: {pull_secret_path}")
-            tmp_server = "/tmp/cluster-tool-pull-secret.json"
-            if env.is_local:
-                subprocess.run(["cp", pull_secret_path, tmp_server], check=True)
-            else:
-                subprocess.run(
-                    ["scp"] + SSH_OPTS + [pull_secret_path, f"{env.host}:{tmp_server}"],
-                    capture_output=True, text=True, check=True,
-                )
-            env.run(f"scp {' '.join(SSH_OPTS)} -i {key_path} {tmp_server} core@{vm_ip}:/tmp/pull-secret.json")
-            env.run_vm(vm_ip, "sudo cp /tmp/pull-secret.json /var/lib/kubelet/config.json && rm /tmp/pull-secret.json", identity=key_path)
-            env.run(f"rm -f {tmp_server}")
 
         env.run_vm(vm_ip, "sudo systemctl start crio", identity=key_path)
         time.sleep(3)
@@ -987,6 +976,18 @@ def cmd_boot(args):
             time.sleep(5)
         else:
             sys.exit("Cluster not healthy after 10 minutes")
+
+        if pull_secret_path:
+            ps_b64 = base64.b64encode(Path(pull_secret_path).read_bytes()).decode()
+            kc_path = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
+            oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
+            env.run_vm(vm_ip,
+                f"echo {ps_b64} | base64 -d > /tmp/ps.json && "
+                f"{oc_vm} set data secret/pull-secret -n openshift-config "
+                f"--from-file=.dockerconfigjson=/tmp/ps.json && "
+                f"rm /tmp/ps.json",
+                identity=key_path)
+
         print_step(6, total, "Waiting for cluster health", "done")
 
         print_step(7, total, "Configuring access")
@@ -1077,14 +1078,6 @@ def cmd_boot(args):
         print_step(9, total, "Verifying cluster identity")
         verify_cluster_identity(vm_ip, clone_id, domain, identity=key_path)
         print_step(9, total, "Verifying cluster identity", "done")
-
-        if pull_secret_path:
-            kc_path = "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig"
-            oc_vm = f"sudo oc --kubeconfig={kc_path} --insecure-skip-tls-verify"
-            env.run_vm(vm_ip,
-                f"{oc_vm} set data secret/pull-secret -n openshift-config "
-                f"--from-file=.dockerconfigjson=/var/lib/kubelet/config.json",
-                identity=key_path)
 
     except (SystemExit, subprocess.CalledProcessError) as e:
         if args.no_rollback:
