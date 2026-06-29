@@ -879,10 +879,22 @@ def cmd_boot(args):
         src_sec_ip = f"192.168.{src_secondary}.{VM_IP_SUFFIX}"
         new_sec_ip = f"192.168.{subnet_sec}.{VM_IP_SUFFIX}"
 
+        pull_secret_path = getattr(args, 'pull_secret', None)
+        if pull_secret_path:
+            pull_secret_path = os.path.expanduser(pull_secret_path)
+            if not os.path.isfile(pull_secret_path):
+                sys.exit(f"Pull secret not found: {pull_secret_path}")
+
         env.run_vm(vm_ip, "sudo systemctl stop kubelet", identity=key_path)
         time.sleep(5)
         env.run_vm(vm_ip, "sudo systemctl stop crio", identity=key_path)
         time.sleep(5)
+
+        if pull_secret_path:
+            ps_b64 = base64.b64encode(Path(pull_secret_path).read_bytes()).decode()
+            env.run_vm(vm_ip,
+                f"echo {ps_b64} | base64 -d | sudo tee /var/lib/kubelet/config.json > /dev/null",
+                identity=key_path)
 
         env.run(f"scp {' '.join(SSH_OPTS)} -i {key_path} -r {crypto} core@{vm_ip}:/tmp/crypto")
         ingress_cn = env.run(f"cat {crypto}/ingress-cn.txt").stdout.strip()
@@ -930,7 +942,8 @@ def cmd_boot(args):
             f"--use-key kube-apiserver-localhost-signer:/tmp/crypto/localhost-signer.key "
             f"--use-key kube-apiserver-service-network-signer:/tmp/crypto/service-network-signer.key "
             f"--use-key {ingress_cn}:/tmp/crypto/ingress.key "
-            f"--cluster-rename test-infra-cluster-{clone_id}:redhat.com "
+            + (f"--use-key hypershift-webhook-ca:/tmp/crypto/hypershift-webhook-ca.key " if env.run(f"test -f {crypto}/hypershift-webhook-ca.key", check=False).returncode == 0 else "")
+            + f"--cluster-rename test-infra-cluster-{clone_id}:redhat.com "
             f"--hostname {vm_name} "
             f"--ip {vm_ip} "
             f"--cn-san-replace api.test-infra-cluster-{source_id}.redhat.com:api.{domain} "
@@ -970,12 +983,6 @@ def cmd_boot(args):
         )
         fix_b64 = base64.b64encode(node_fix.encode()).decode()
         env.run_vm(vm_ip, f"echo {fix_b64} | base64 -d | sudo python3", identity=key_path)
-
-        pull_secret_path = getattr(args, 'pull_secret', None)
-        if pull_secret_path:
-            pull_secret_path = os.path.expanduser(pull_secret_path)
-            if not os.path.isfile(pull_secret_path):
-                sys.exit(f"Pull secret not found: {pull_secret_path}")
 
         env.run_vm(vm_ip, "sudo systemctl start crio", identity=key_path)
         time.sleep(3)
