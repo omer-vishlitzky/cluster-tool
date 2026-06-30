@@ -177,7 +177,7 @@ def parse_manifest(raw):
     return manifest
 
 
-RECERT_IMAGE = "quay.io/rh-ee-ovishlit/recert:latest"
+RECERT_IMAGE = "quay.io/osac-project/recert:latest"
 ETCD_IMAGE = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:96e7c7f2ccac380f0b57c6b3be73c09df05d46b3ff7864acb1ba4fc063d72508"
 @functools.lru_cache(maxsize=1)
 def _dnsmasq_dir():

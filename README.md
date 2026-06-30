@@ -22,7 +22,7 @@ Flavors can be pushed to an OCI registry (Quay.io) and pulled on any baremetal m
 ## Installation
 
 ```bash
-git clone https://github.com/omer-vishlitzky/cluster-tool.git
+git clone https://github.com/osac-project/cluster-tool.git
 cd cluster-tool
 ./cluster-tool --help
 ```
