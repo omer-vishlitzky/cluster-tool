@@ -61,7 +61,7 @@ The volume mount uses a different container path (`/store` instead of `/var/lib/
 
 ### Forked Recert Image
 
-We use `quay.io/rh-ee-ovishlit/recert:latest` with two fixes over upstream:
+We use `quay.io/osac-project/recert:latest` with two fixes over upstream:
 
 1. **Binary DER data handling** — upstream crashes on secrets with binary certificate data. The fork returns `None` for non-UTF-8 data instead of erroring.
 2. **PersistentVolume node affinity** — upstream doesn't update PV node affinity hostnames during `--hostname`. The fork adds PV support in etcd encoding and hostname replacement.
